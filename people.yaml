@@ -1,0 +1,59 @@
+# people.yaml — the seed and source of truth for the call-handler database.
+#
+# This file is how you manage the database:
+#   bin/vapi.py sync     # push this file -> live Dynamo
+#   bin/vapi.py edit     # pull live Dynamo into this file, open $EDITOR,
+#                        # save to commit back (or quit without saving to cancel)
+# The webhook also ships a copy of this file and falls back to it if Dynamo
+# is unreachable, so keep it in the repo.
+#
+# Fields per person:
+#   id:            optional slug; derived from name when omitted
+#   name:          display name (required)
+#   my_name:       which name to use when this person calls: Chris or David
+#   relationship:  free-form ("mom", "neighbor", "rabbi's wife")
+#   phone_numbers: every line this person calls from. If TWO people list the
+#                  same line, it becomes a shared line — the assistant greets
+#                  generically and asks who's speaking
+#   notes:         durable facts about them (seeded by hand, then LLM-maintained
+#                  by the phase-3 summarizer; omit to keep the live value)
+#   follow_ups:    things to bring up on the next call
+#
+# This repo is PUBLIC — do not commit real names, numbers, or other PII.
+# The entries below are fictional examples using 555-01XX numbers (reserved
+# for fiction); replace them with your real data, which then lives only on
+# your machine and in live Dynamo (`bin/vapi.py pull` refreshes this file
+# from the live data).
+people:
+  - id: maria
+    name: Maria
+    my_name: David
+    relationship: mom
+    phone_numbers:
+      - "+15550123400"   # her cell
+      - "+15550123401"   # second line, e.g. her office
+    notes: "Loves hearing about the latest build."
+    follow_ups: "Ask how the garden is doing."
+
+  - id: sam
+    name: Sam
+    my_name: Chris
+    relationship: neighbor
+    phone_numbers:
+      - "+15550123402"
+
+  # A shared line: both Ruth and Noah list this number, so calls from it
+  # get a generic greeting and the assistant asks who's speaking.
+  - id: ruth
+    name: Ruth
+    my_name: Chris
+    relationship: rabbi's wife
+    phone_numbers:
+      - "+15550123403"
+
+  - id: noah
+    name: Noah
+    my_name: Chris
+    relationship: ruth's son
+    phone_numbers:
+      - "+15550123403"

@@ -1,0 +1,12 @@
+node_modules/
+.sst/
+playwright-report/
+test-results/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+local.json
+people.yaml.bak
+.DS_Store
