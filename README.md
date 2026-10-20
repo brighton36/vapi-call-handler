@@ -5,11 +5,11 @@
 > data lives only in gitignored local files (`people.yaml`, `local.json`,
 > `secrets.json`) and the live AWS/Vapi services.
 
-Routes inbound calls on Chris's personal Vapi number so the assistant knows
+Routes inbound calls on my personal Vapi number so the assistant knows
 who's calling — and eventually what they've talked about before.
 
 - **Phase 1 (this):** webhook answers `assistant-request` with the caller's
-  name + which name to use ("Chris" vs "David"), and archives every
+  name + which name to use, and archives every
   `end-of-call-report` (transcript + messages) to S3, indexed by person.
 - **Phase 3 (not built):** after each call, a summarizer rewrites the
   person's llm notes + follow-ups so the next call can pick up where the
@@ -49,9 +49,13 @@ the actual speaker.
 
 ## Stack
 
-SST v4 → us-west-2 (Vapi's docs say to host the webhook near us-west-2;
-`assistant-request` must be answered in 7.5s end-to-end):
+AWS CDK (TypeScript, `aws-cdk-lib`) → us-west-2 (Vapi's docs say to host the
+webhook near us-west-2; `assistant-request` must be answered in 7.5s
+end-to-end):
 
+- `src/main.ts` / `src/vapi-call-handler.ts` — the CDK app + single
+  `VapiCallHandlerStack` (region pinned in the app). Synthesizes the tables,
+  bucket, both Lambdas, the stream trigger, and a public Lambda Function URL.
 - `functions/api.ts` — the webhook (Lambda with a public Function URL).
   - `assistant-request`: number → NumberIndex → People (one batch read,
     ~10ms) → `assistantOverrides.variableValues`.
@@ -85,7 +89,7 @@ is the committed, fictional sample. Each entry is a person:
 people:
   - id: maria            # optional; derived from the name when omitted
     name: Maria
-    my_name: David     # which name to use when they call: Chris or David
+    my_name: David     # which name to use when they call
     relationship: mom
     phone_numbers:     # every line they call from
       - "+15550123400"
@@ -131,20 +135,22 @@ pip install boto3 requests pyyaml
 cp local.json.example local.json       # Vapi number/assistant IDs + fallbackNumber (your cell)
 cp secrets.json.example secrets.json   # vapiToken + vapiWebhookSecret (openssl rand -hex 24)
 cp people.example.yaml people.yaml     # then replace the sample with your real people
-npx sst deploy --stage production      # writes .sst/outputs.json
+npm run build                          # cdk synth — writes cdk.out/outputs.json
+npm run deploy                         # cdk deploy (us-west-2, pinned in the app)
 bin/vapi.py sync                 # seed live Dynamo from people.yaml
 bin/vapi.py vapi sync            # point the number at the webhook (url read from outputs.json)
 ```
 
 All three local files are gitignored. `secrets.json` is read by both
-`sst.config.ts` (the webhook secret goes into the Lambda's environment at
-deploy) and `bin/vapi.py` (Vapi API token, and the same webhook secret for
-`vapi sync`) — no env vars, no `sst secret`.
+the CDK stack (`src/vapi-call-handler.ts` — the webhook secret goes into
+the Lambda's environment at deploy) and `bin/vapi.py` (Vapi API token,
+and the same webhook secret for `vapi sync`) — no env vars, no cdk
+secrets.
 
 `local.json` (gitignored) holds the two Vapi identifiers — your personal
 phone number's ID and the Mobile Call Screener assistant ID — from the Vapi
 dashboard (Numbers / Assistants pages), plus `fallbackNumber`, where calls
-are forwarded if the webhook fails. `sst.config.ts` reads the assistant
+are forwarded if the webhook fails. The CDK stack reads the assistant
 ID from it at deploy time; `bin/vapi.py` reads the rest for the
 `vapi show` / `vapi sync` commands.
 
@@ -163,7 +169,7 @@ Mobile Call Screener assistant needs a prompt that references them
 (it currently has no instructions; writing them is a phase-1 prerequisite):
 
 - `{{callerName}}` — blank for unknown callers **and shared lines**
-- `{{myName}}` — "Chris" or "David" (defaults to Chris)
+- `{{myName}}` — who to represent
 - `{{callerRelationship}}` — "mom", "neighbor", ...
 - `{{callerNotes}}` — phase 3; empty for now
 - `{{callerSharedWith}}` — "Ruth, Noah" for a shared line (everyone who
@@ -182,7 +188,7 @@ Mobile Call Screener assistant needs a prompt that references them
   asks rather than assumes.
 - Webhook down or slow → Vapi uses the number's `assistantId` (current
   static assistant), or if even that fails the `fallbackDestination`
-  forwards the call to Chris's phone.
+  forwards the call to my phone.
 - Every call, whether handled or not, lands in S3 + CallIndex (the
   end-of-call-report path re-resolves the person, so the index is
   person-keyed even for calls that took the fallback path).
@@ -198,12 +204,12 @@ bin/vapi.py sync                       # people.yaml -> live Dynamo
 bin/vapi.py people                     # list everyone + their lines
 bin/vapi.py line show +15550123403     # who uses this line
 # ad-hoc (writes Dynamo directly; a later `pull`/`edit` picks it up):
-bin/vapi.py add Sophie --my-name Chris --relationship aunt --number +1555...
+bin/vapi.py add Sophie --my-name John --relationship aunt --number +1555...
 bin/vapi.py line add  +15550123403 ruth noah   # make a line shared
 bin/vapi.py calls --days 7            # recent calls
 bin/vapi.py calls --person maria        # everything we've discussed with maria
 bin/vapi.py call <callId>             # full archive (transcript + messages)
-cat .sst/outputs.json                 # Function URL, table/bucket names (written by deploy)
+cat cdk.out/outputs.json           # Function URL, table/bucket names (written by synth)
 ```
 
 Tests: `npx vitest run` (no AWS needed — pure resolution logic only).

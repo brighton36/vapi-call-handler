@@ -1,5 +1,6 @@
 node_modules/
-.sst/
+cdk.out/
+lambda-dist/
 playwright-report/
 test-results/
 __pycache__/

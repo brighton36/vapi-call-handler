@@ -5,7 +5,6 @@ import {
   PutItemCommand,
 } from '@aws-sdk/client-dynamodb'
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
-import { Resource } from 'sst'
 import { authGuard, timingMiddleware, extractCallerNumber, callDurationSeconds, parseWebhookBody } from '../lib/vapi'
 import { computeFrequency, describeFrequency } from '../lib/frequency'
 import { loadPeopleFile, resolveFromPeopleFile, fromPersonDynamo } from '../lib/people'
@@ -21,6 +20,14 @@ import type {
 const ddb = new DynamoDBClient({})
 const s3 = new S3Client({})
 
+// Resource names come from the function's environment — the CDK stack
+// (src/vapi-call-handler.ts) exports them at deploy, so nothing here
+// hardcodes a table or bucket name.
+const PEOPLE_TABLE = process.env.VAPI_PEOPLE_TABLE!
+const NUMBER_INDEX_TABLE = process.env.VAPI_NUMBER_INDEX_TABLE!
+const CALL_INDEX_TABLE = process.env.VAPI_CALL_INDEX_TABLE!
+const CALL_LOGS_BUCKET = process.env.VAPI_CALL_LOGS_BUCKET!
+
 // No caller to resolve to (missing number, or a line nobody's mapped).
 const EMPTY_RESOLUTION: Resolution = { personIds: [], person: null }
 
@@ -33,7 +40,7 @@ async function resolveCaller(number: string): Promise<Resolution> {
   try {
     const numberRow = await ddb
       .send(new GetItemCommand({
-        TableName: Resource.NumberIndex.name,
+        TableName: NUMBER_INDEX_TABLE,
         Key: { number: { S: number } },
       }))
       .then((r) => r.Item)
@@ -58,13 +65,13 @@ async function fetchPeople(ids: string[]): Promise<Record<string, Person | undef
     const res = await ddb.send(
       new BatchGetItemCommand({
         RequestItems: {
-          [Resource.People.name]: {
+          [PEOPLE_TABLE]: {
             Keys: ids.map((id) => ({ id: { S: id } })),
           },
         },
       })
     )
-    for (const it of res.Responses?.[Resource.People.name] ?? []) {
+    for (const it of res.Responses?.[PEOPLE_TABLE] ?? []) {
       const id = (it as any).id?.S
       if (id) out[id] = fromPersonDynamo(it)
     }
@@ -153,13 +160,13 @@ async function namesFor(ids: string[]): Promise<Record<string, string>> {
       const res = await ddb.send(
         new BatchGetItemCommand({
           RequestItems: {
-            [Resource.People.name]: {
+            [PEOPLE_TABLE]: {
               Keys: missing.map((id) => ({ id: { S: id } })),
             },
           },
         })
       )
-      for (const it of (res.Responses?.[Resource.People.name] ?? [])) {
+      for (const it of (res.Responses?.[PEOPLE_TABLE] ?? [])) {
         const id = (it as any).id?.S
         const name = (it as any).name?.S
         if (id && name) out[id] = name
@@ -201,7 +208,7 @@ async function storeCallReport(payload: EndOfCallReportPayload, res: Resolution)
   try {
     await s3.send(
       new PutObjectCommand({
-        Bucket: Resource.CallLogs.name,
+        Bucket: CALL_LOGS_BUCKET,
         Key: `calls/${date}/${call.id}.json`,
         Body: JSON.stringify(log, null, 2),
         ContentType: 'application/json',
@@ -223,7 +230,7 @@ async function storeCallReport(payload: EndOfCallReportPayload, res: Resolution)
   try {
     await ddb.send(
       new PutItemCommand({
-        TableName: Resource.CallIndex.name,
+        TableName: CALL_INDEX_TABLE,
         Item: {
           callId: { S: call.id },
           personId: { S: indexedPersonId },

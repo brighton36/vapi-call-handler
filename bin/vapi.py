@@ -98,7 +98,7 @@ def read_local():
 
 def read_secrets():
     """Vapi token + webhook secret from gitignored secrets.json (same file
-    sst.config.ts reads at deploy)."""
+    the CDK stack reads at deploy)."""
     try:
         with open(SECRETS_JSON) as f:
             return json.load(f)
@@ -149,20 +149,43 @@ def s3():
     return boto3.client("s3", region_name="us-west-2")
 
 
+CFN_STACK = "VapiCallHandlerStack"
+# CfnOutput id in the CDK stack -> key this CLI expects
+_OUTPUT_MAP = {
+    "OutUrl": "url",
+    "OutPeople": "People",
+    "OutNumberIndex": "NumberIndex",
+    "OutCallIndex": "CallIndex",
+    "OutCallLogs": "CallLogs",
+}
+
+
 def _outputs():
-    # SST v4 writes the run() return value here on every deploy.
-    path = os.path.join(REPO, ".sst", "outputs.json")
+    """Read the deployed stack's outputs via the CloudFormation API
+    (the CDK stack's CfnOutputs, see src/vapi-call-handler.ts)."""
+    import boto3
+    cfn = boto3.client("cloudformation", region_name="us-west-2")
     try:
-        with open(path) as f:
-            return json.load(f)
-    except FileNotFoundError:
-        sys.exit(f"{path} not found — run `npx sst deploy --stage production` first")
+        r = cfn.describe_stacks(StackName=CFN_STACK)
+    except Exception as e:
+        sys.exit(f"cannot read stack '{CFN_STACK}': {e}")
+    if not r["Stacks"] or r["Stacks"][0]["StackStatus"] != "CREATE_COMPLETE":
+        status = r["Stacks"][0]["StackStatus"] if r["Stacks"] else "missing"
+        sys.exit(f"stack '{CFN_STACK}' is not deployed yet (status: {status}) — run `npm run deploy`")
+    out = {}
+    for o in r["Stacks"][0].get("Outputs", []):
+        key = _OUTPUT_MAP.get(o["OutputKey"])
+        if key:
+            out[key] = o["OutputValue"]
+    if not out:
+        sys.exit(f"stack '{CFN_STACK}' has no outputs — redeploy")
+    return out
 
 
 def T(name):
     out = _outputs()
     if name not in out:
-        sys.exit(f"'{name}' missing from .sst/outputs.json — redeploy")
+        sys.exit(f"'{name}' missing from the deployed stack's outputs — redeploy")
     return out[name]
 
 
@@ -603,7 +626,7 @@ def cmd_vapi_sync(a):
     url = a.url or _outputs().get("url")
     secret = a.secret or read_secrets().get("vapiWebhookSecret")
     if not url:
-        sys.exit("need --url (the Function URL, `url` in .sst/outputs.json after deploy)")
+        sys.exit("need --url (the Function URL — also read from the deployed stack's outputs after `npm run deploy`)")
     if not secret:
         sys.exit("need --secret or vapiWebhookSecret in secrets.json")
     fallback = a.fallback_number or read_local().get("fallbackNumber")

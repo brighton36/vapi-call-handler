@@ -4,10 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "deploy": "sst deploy",
-    "dev": "sst dev",
-    "output": "sst output",
-    "remove": "sst remove",
+    "build": "cdk synth",
+    "deploy": "cdk deploy",
+    "diff": "cdk diff",
+    "remove": "cdk destroy",
     "test": "vitest run"
   },
   "dependencies": {
@@ -18,7 +18,11 @@
   "devDependencies": {
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^26.1.1",
-    "sst": "^4.17.1",
+    "aws-cdk": "^2.170.0",
+    "aws-cdk-lib": "^2.170.0",
+    "constructs": "^10.8.1",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.23.15",
     "typescript": "^5.9.0",
     "vitest": "^3.2.0"
   },

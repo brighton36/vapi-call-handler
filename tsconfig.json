@@ -10,5 +10,5 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["functions", "lib", "tests", "sst.config.ts", "sst-env.d.ts"]
+  "include": ["functions", "lib", "src", "tests"]
 }

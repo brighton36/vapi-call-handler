@@ -57,7 +57,8 @@ export function parsePeopleYaml(text: string): People {
 
 // The in-repo seed + fallback, bundled into the Lambda. Dynamo is the live
 // source; this file is what the webhook falls back to when Dynamo is down.
-// people.yaml is copied to the function bundle root (SST copyFiles). We probe
+// people.yaml is copied to the function bundle root (scripts/bundle.mjs).
+// We probe
 // a few candidate locations (cwd, and the directory this module lives in) so
 // it works whether cwd is the bundle root or the repo root. A missing or
 // unparseable file yields {} (treat everyone as unknown) rather than throwing

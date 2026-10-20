@@ -11,10 +11,13 @@
 // too. It must NEVER write People.personalNotes.
 
 import { DynamoDBClient, QueryCommand, UpdateItemCommand } from '@aws-sdk/client-dynamodb'
-import { Resource } from 'sst'
 import { computeFrequency, WINDOW_MS } from '../lib/frequency'
 
 const ddb = new DynamoDBClient({})
+
+// Resource names from the function's environment (set by the CDK stack).
+const PEOPLE_TABLE = process.env.VAPI_PEOPLE_TABLE!
+const CALL_INDEX_TABLE = process.env.VAPI_CALL_INDEX_TABLE!
 
 // Minimal shape of a DynamoDB stream event (avoids an @types/aws-lambda dep).
 interface StreamRecord {
@@ -43,7 +46,7 @@ async function startedAtsSince(personId: string, sinceIso: string): Promise<stri
   do {
     const r = await ddb.send(
       new QueryCommand({
-        TableName: Resource.CallIndex.name,
+        TableName: CALL_INDEX_TABLE,
         IndexName: 'ByPerson',
         KeyConditionExpression: 'personId = :p AND startedAt >= :since',
         ExpressionAttributeValues: { ':p': { S: personId }, ':since': { S: sinceIso } },
@@ -69,7 +72,7 @@ async function refreshFrequency(personId: string, now: Date) {
   }
   await ddb.send(
     new UpdateItemCommand({
-      TableName: Resource.People.name,
+      TableName: PEOPLE_TABLE,
       Key: { id: { S: personId } },
       UpdateExpression:
         'SET callsLast24h = :d, callsLast7d = :w, callsLast30d = :m, recentCalls = :r, frequencyUpdatedAt = :u',
@@ -83,7 +86,7 @@ async function refreshFrequency(personId: string, now: Date) {
     await ddb
       .send(
         new UpdateItemCommand({
-          TableName: Resource.People.name,
+          TableName: PEOPLE_TABLE,
           Key: { id: { S: personId } },
           UpdateExpression: 'SET lastCalled = :last',
           ConditionExpression: 'attribute_exists(id) AND (attribute_not_exists(lastCalled) OR lastCalled < :last)',
