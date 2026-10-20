@@ -5,7 +5,9 @@ import {
   PutItemCommand,
 } from '@aws-sdk/client-dynamodb'
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
-import { authGuard, timingMiddleware, extractCallerNumber } from '../lib/vapi'
+import { Resource } from 'sst'
+import { authGuard, timingMiddleware, extractCallerNumber, callDurationSeconds, parseWebhookBody } from '../lib/vapi'
+import { computeFrequency, describeFrequency } from '../lib/frequency'
 import { loadPeopleFile, resolveFromPeopleFile, fromPersonDynamo } from '../lib/people'
 import type { Resolution } from '../lib/people'
 import type {
@@ -31,7 +33,7 @@ async function resolveCaller(number: string): Promise<Resolution> {
   try {
     const numberRow = await ddb
       .send(new GetItemCommand({
-        TableName: process.env.SST_NumberIndex_TableName!,
+        TableName: Resource.NumberIndex.name,
         Key: { number: { S: number } },
       }))
       .then((r) => r.Item)
@@ -56,13 +58,13 @@ async function fetchPeople(ids: string[]): Promise<Record<string, Person | undef
     const res = await ddb.send(
       new BatchGetItemCommand({
         RequestItems: {
-          [process.env.SST_People_TableName!]: {
+          [Resource.People.name]: {
             Keys: ids.map((id) => ({ id: { S: id } })),
           },
         },
       })
     )
-    for (const it of res.Responses?.[process.env.SST_People_TableName!] ?? []) {
+    for (const it of res.Responses?.[Resource.People.name] ?? []) {
       const id = (it as any).id?.S
       if (id) out[id] = fromPersonDynamo(it)
     }
@@ -79,6 +81,27 @@ interface PromptContext {
   callerRelationship: string
   callerNotes: string
   callerSharedWith: string
+  // How often they've called lately, e.g. "2 calls in the last 24 hours, 3 in
+  // the last week, 5 in the last month". '' = no calls in 30 days / unknown.
+  callerCallFrequency: string
+  callerCallsLast24h: number
+  callerCallsLast7d: number
+  callerCallsLast30d: number
+}
+
+const NO_FREQUENCY = { callerCallFrequency: '', callerCallsLast24h: 0, callerCallsLast7d: 0, callerCallsLast30d: 0 }
+
+// Frequency is computed by the deferred after-call job (recentCalls on the
+// People row). Re-bucket those stored timestamps against now so the counts
+// stay right even if the person hasn't called since — no extra read.
+function frequencyContext(recentCalls: string[] | undefined, now = new Date()) {
+  const f = computeFrequency(recentCalls ?? [], now)
+  return {
+    callerCallFrequency: describeFrequency(f),
+    callerCallsLast24h: f.callsLast24h,
+    callerCallsLast7d: f.callsLast7d,
+    callerCallsLast30d: f.callsLast30d,
+  }
 }
 
 // What the assistant prompt sees. Three cases, intentionally distinct:
@@ -88,7 +111,7 @@ interface PromptContext {
 //                      the prompt is told to ask, not assume.
 async function toPromptContext(res: Resolution): Promise<PromptContext> {
   if (res.personIds.length === 0) {
-    return { callerName: '', myName: 'Chris', callerRelationship: '', callerNotes: '', callerSharedWith: '' }
+    return { callerName: '', myName: 'Chris', callerRelationship: '', callerNotes: '', callerSharedWith: '', ...NO_FREQUENCY }
   }
   if (res.personIds.length === 1 && res.person) {
     const p = res.person
@@ -96,8 +119,9 @@ async function toPromptContext(res: Resolution): Promise<PromptContext> {
       callerName: p.name ?? '',
       myName: p.myName ?? 'Chris',
       callerRelationship: p.relationship ?? '',
-      callerNotes: [p.profile, p.followUps].filter(Boolean).join(' '),
+      callerNotes: [p.personalNotes, p.llmNotes, p.followUps].filter(Boolean).join(' '),
       callerSharedWith: '',
+      ...frequencyContext('recentCalls' in p ? p.recentCalls : undefined),
     }
   }
   // Shared line: we don't know who's speaking, so greet generically (default
@@ -109,6 +133,7 @@ async function toPromptContext(res: Resolution): Promise<PromptContext> {
     callerRelationship: '',
     callerNotes: '',
     callerSharedWith: res.personIds.map((id) => names[id]).join(', '),
+    ...NO_FREQUENCY,
   }
 }
 
@@ -128,13 +153,13 @@ async function namesFor(ids: string[]): Promise<Record<string, string>> {
       const res = await ddb.send(
         new BatchGetItemCommand({
           RequestItems: {
-            [process.env.SST_People_TableName!]: {
+            [Resource.People.name]: {
               Keys: missing.map((id) => ({ id: { S: id } })),
             },
           },
         })
       )
-      for (const it of (res.Responses?.[process.env.SST_People_TableName!] ?? [])) {
+      for (const it of (res.Responses?.[Resource.People.name] ?? [])) {
         const id = (it as any).id?.S
         const name = (it as any).name?.S
         if (id && name) out[id] = name
@@ -176,7 +201,7 @@ async function storeCallReport(payload: EndOfCallReportPayload, res: Resolution)
   try {
     await s3.send(
       new PutObjectCommand({
-        Bucket: process.env.SST_CallLogs_BucketName!,
+        Bucket: Resource.CallLogs.name,
         Key: `calls/${date}/${call.id}.json`,
         Body: JSON.stringify(log, null, 2),
         ContentType: 'application/json',
@@ -186,38 +211,54 @@ async function storeCallReport(payload: EndOfCallReportPayload, res: Resolution)
     console.error('failed to store S3 call log:', err)
   }
 
-  // Queryable index row. PutItem by callId is idempotent — a redelivered
-  // report just overwrites with the same data. personId: the person on a
+  // Queryable index row. The INSERT also fires the deferred after-call job
+  // (CallIndex stream -> functions/after-call.ts), which recomputes the
+  // person's call frequency. personId: the person on a
   // personal line, 'shared' for shared lines, 'unknown' otherwise — so
   // `calls --person shared` lists shared-line calls until phase 3 attributes
   // them to a real person.
   const indexedPersonId = res.personIds.length === 1 ? res.personIds[0] : (res.personIds.length > 1 ? 'shared' : 'unknown')
+  const startedAt = call.startedAt ?? new Date().toISOString()
+  const duration = callDurationSeconds(call.startedAt, call.endedAt)
   try {
     await ddb.send(
       new PutItemCommand({
-        TableName: process.env.SST_CallIndex_TableName!,
+        TableName: Resource.CallIndex.name,
         Item: {
           callId: { S: call.id },
           personId: { S: indexedPersonId },
           ...(res.personIds.length > 1 ? { personIds: { L: res.personIds.map((id) => ({ S: id })) } } : {}),
           number: { S: call.customer?.number ?? '' },
-          startedAt: { S: call.startedAt ?? new Date().toISOString() },
+          startedAt: { S: startedAt },
+          ...(call.endedAt ? { endedAt: { S: call.endedAt } } : {}),
+          ...(duration !== undefined ? { durationSeconds: { N: String(duration) } } : {}),
           ...(payload.message.endedReason ? { endedReason: { S: payload.message.endedReason } } : {}),
           ...(typeof payload.message.cost === 'number' ? { cost: { N: String(payload.message.cost) } } : {}),
+          // llmNotes: written later by the phase-3 summarizer.
         },
+        // Only the first delivery creates the row, so a redelivered report
+        // doesn't re-fire the after-call job.
+        ConditionExpression: 'attribute_not_exists(callId)',
       })
     )
     console.info('call indexed', { callId: call.id, personId: indexedPersonId })
-  } catch (err) {
+  } catch (err: any) {
+    if (err?.name === 'ConditionalCheckFailedException') {
+      console.info('call already indexed (redelivery)', { callId: call.id })
+      return
+    }
     console.error('failed to store CallIndex row:', err)
+    return
   }
+
 }
 
 // ---------------------------------------------------------------- handler
 
 export const handler = authGuard(
   timingMiddleware(async (event: any) => {
-    const payload = event as AssistantRequestPayload | EndOfCallReportPayload
+    // Function URL events carry the Vapi JSON as a (maybe base64) string body.
+    const payload = parseWebhookBody(event) as AssistantRequestPayload | EndOfCallReportPayload
     const type = payload?.message?.type
     const started = Date.now()
 
@@ -250,8 +291,8 @@ export const handler = authGuard(
       })
       const res = number ? await resolveCaller(number) : EMPTY_RESOLUTION
       await storeCallReport(ep, res)
-      // Phase 3: summarizer (triggered from here) reads the S3 file, rewrites
-      // People.profile/followUps, and backfills CallIndex.summary.
+      // Deferred work (frequency now; phase-3 summarizer later) runs off the
+      // CallIndex stream in functions/after-call.ts — not on this path.
       console.info('end-of-call-report acknowledged', {
         callId: ep.message.call.id,
         personIds: res.personIds,

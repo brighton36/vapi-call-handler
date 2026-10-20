@@ -58,7 +58,7 @@ export interface EndOfCallReportPayload {
 //   - one number can be shared by several people (Ruth + her son)
 //
 // Dynamo tables:
-//   People        hash: id (slug, e.g. "maria")                        -> profile
+//   People        hash: id (slug, e.g. "maria")                        -> personalNotes, llmNotes, followUps, ...
 //   NumberIndex   hash: number (E.164)                               -> people[] (1 = personal, >1 = shared)
 //   CallIndex     hash: callId, GSI ByPerson(personId, startedAt)    -> per-call row
 //
@@ -72,12 +72,22 @@ export interface Person {
   // Which name to call Chris when this person calls: "Chris" or "David".
   myName?: string
   relationship?: string
-  // Phase 3: LLM-maintained profile of who they are + durable topics.
-  profile?: string
+  // Hand-edited by you in people.yaml. The LLM / phase-3 summarizer must
+  // NEVER write this.
+  personalNotes?: string
+  // Phase 3: LLM-maintained notes distilled from call history. The
+  // summarizer may rewrite this; it must never touch personalNotes.
+  llmNotes?: string
   // Phase 3: things to raise next time ("ask how Milo's vet visit went").
   followUps?: string
   calls?: number
   lastCalled?: string
+  // Written by the deferred after-call job (functions/after-call.ts).
+  // recentCalls = startedAt of each call in the last 30 days, newest first.
+  recentCalls?: string[]
+  callsLast24h?: number
+  callsLast7d?: number
+  callsLast30d?: number
 }
 
 export interface NumberIndexItem {
@@ -97,10 +107,13 @@ export interface CallIndexItem {
   number: string
   // ISO timestamp — GSI range key, so lex order = chronological order.
   startedAt: string
+  endedAt?: string
+  durationSeconds?: number
   endedReason?: string
   cost?: number
-  // Phase 3: one-line summary of the call.
-  summary?: string
+  // Phase 3: LLM-written notes about this one call. (Per-call counterpart of
+  // People.llmNotes; there is no per-call personal notes field.)
+  llmNotes?: string
 }
 
 // One call, archived to S3 as calls/<YYYY-MM-DD>/<callId>.json
@@ -134,6 +147,9 @@ export interface PersonFileEntry {
   relationship?: string
   // Every line this person calls from.
   numbers: string[]
+  // From people.yaml personal_notes / llm_notes.
+  personalNotes?: string
+  llmNotes?: string
 }
 
 export type People = Record<string, PersonFileEntry>

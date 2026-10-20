@@ -15,8 +15,10 @@
 #   phone_numbers: every line this person calls from. If TWO people list the
 #                  same line, it becomes a shared line — the assistant greets
 #                  generically and asks who's speaking
-#   notes:         durable facts about them (seeded by hand, then LLM-maintained
-#                  by the phase-3 summarizer; omit to keep the live value)
+#   personal_notes: durable facts, hand-edited by you. The LLM / phase-3
+#                   summarizer never touches this.
+#   llm_notes:      notes the phase-3 summarizer maintains from call history
+#                   (omit to keep the live value)
 #   follow_ups:    things to bring up on the next call
 #
 # This repo is PUBLIC — do not commit real names, numbers, or other PII.
@@ -32,7 +34,8 @@ people:
     phone_numbers:
       - "+15550123400"   # her cell
       - "+15550123401"   # second line, e.g. her office
-    notes: "Loves hearing about the latest build."
+    personal_notes: "Loves hearing about the latest build."
+    llm_notes: "Prefers calls in the afternoon."
     follow_ups: "Ask how the garden is doing."
 
   - id: sam

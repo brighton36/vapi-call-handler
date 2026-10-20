@@ -1,12 +1,14 @@
 import { describe, it, expect } from 'vitest'
-import { timingMiddleware, extractCallerNumber } from '../lib/vapi'
+import { timingMiddleware, extractCallerNumber, callDurationSeconds, parseWebhookBody } from '../lib/vapi'
+import { computeFrequency, describeFrequency } from '../lib/frequency'
+import { personIdsFromStream } from '../functions/after-call'
 import { resolveFromPeopleFile, parsePeopleYaml, slugify } from '../lib/people'
 import { readFileSync } from 'node:fs'
 import type { People } from '../lib/types'
 
 // Parse the (fictional) seed file so the tests track what ships.
 const here = new URL('.', import.meta.url).pathname
-const people: People = parsePeopleYaml(readFileSync(here + '../people.yaml', 'utf8'))
+const people: People = parsePeopleYaml(readFileSync(here + '../people.example.yaml', 'utf8'))
 
 describe('extractCallerNumber', () => {
   it('extracts a clean E.164 number', () => {
@@ -24,6 +26,79 @@ describe('extractCallerNumber', () => {
   it('returns null when there is no number', () => {
     const p = { message: { type: 'assistant-request', call: { customer: {} } } }
     expect(extractCallerNumber(p as any)).toBeNull()
+  })
+})
+
+describe('callDurationSeconds', () => {
+  it('computes whole seconds between start and end', () => {
+    expect(callDurationSeconds('2026-10-16T14:00:00.000Z', '2026-10-16T14:03:25.400Z')).toBe(205)
+  })
+  it('is undefined when a timestamp is missing, bad, or reversed', () => {
+    expect(callDurationSeconds(undefined, '2026-10-16T14:00:00Z')).toBeUndefined()
+    expect(callDurationSeconds('2026-10-16T14:00:00Z', undefined)).toBeUndefined()
+    expect(callDurationSeconds('nope', '2026-10-16T14:00:00Z')).toBeUndefined()
+    expect(callDurationSeconds('2026-10-16T14:05:00Z', '2026-10-16T14:00:00Z')).toBeUndefined()
+  })
+})
+
+describe('computeFrequency', () => {
+  const now = new Date('2026-10-16T12:00:00Z')
+  const calls = [
+    '2026-10-16T11:00:00Z', // 1h ago
+    '2026-10-15T13:00:00Z', // 23h ago
+    '2026-10-15T11:00:00Z', // 25h ago
+    '2026-10-10T12:00:00Z', // 6d ago
+    '2026-09-20T12:00:00Z', // 26d ago
+    '2026-09-01T12:00:00Z', // 45d ago — outside every window
+    '2026-10-17T12:00:00Z', // future (clock skew) — ignored
+  ]
+  it('buckets calls into 24h / 7d / 30d windows', () => {
+    const f = computeFrequency(calls, now)
+    expect(f.callsLast24h).toBe(2)
+    expect(f.callsLast7d).toBe(4)
+    expect(f.callsLast30d).toBe(5)
+    expect(f.recentCalls[0]).toBe('2026-10-16T11:00:00Z')
+    expect(f.recentCalls).toHaveLength(5)
+  })
+  it('dedupes repeated timestamps and decays as time passes', () => {
+    const later = new Date('2026-10-20T12:00:00Z')
+    const f = computeFrequency([...calls, calls[0]], later)
+    expect(f.callsLast24h).toBe(0)
+    // 10-16, 10-15 x2, and the formerly-future 10-17 are now within a week.
+    expect(f.callsLast7d).toBe(4)
+  })
+  it('describes the counts for the prompt', () => {
+    expect(describeFrequency(computeFrequency(calls, now))).toBe(
+      '2 calls in the last 24 hours, 4 in the last week, 5 in the last month',
+    )
+    expect(describeFrequency({ callsLast24h: 0, callsLast7d: 1, callsLast30d: 1 })).toBe(
+      '0 calls in the last 24 hours, 1 in the last week, 1 in the last month',
+    )
+    expect(describeFrequency(computeFrequency([], now))).toBe('')
+  })
+})
+
+describe('personIdsFromStream', () => {
+  it('takes personal-line INSERTs only, deduped', () => {
+    const rec = (eventName: string, personId: string) => ({ eventName, dynamodb: { NewImage: { personId: { S: personId } } } })
+    const ids = personIdsFromStream({
+      Records: [rec('INSERT', 'maria'), rec('INSERT', 'maria'), rec('INSERT', 'unknown'),
+                rec('INSERT', 'shared'), rec('MODIFY', 'sam'), rec('INSERT', 'ruth')] as any,
+    })
+    expect(ids.sort()).toEqual(['maria', 'ruth'])
+  })
+})
+
+describe('parseWebhookBody', () => {
+  const payload = { message: { type: 'assistant-request' } }
+  it('parses a Function URL string body, plain or base64', () => {
+    expect(parseWebhookBody({ body: JSON.stringify(payload) })).toEqual(payload)
+    expect(parseWebhookBody({ body: Buffer.from(JSON.stringify(payload)).toString('base64'), isBase64Encoded: true })).toEqual(payload)
+  })
+  it('passes through an already-parsed payload; bad input -> {}', () => {
+    expect(parseWebhookBody(payload)).toBe(payload)
+    expect(parseWebhookBody({ body: 'not json' })).toEqual({})
+    expect(parseWebhookBody(undefined)).toEqual({})
   })
 })
 
@@ -76,6 +151,12 @@ describe('parsePeopleYaml', () => {
     expect(people.maria.myName).toBe('David')
     expect(people.maria.numbers).toContain('+15550123400')
     expect(people.sam.myName).toBe('Chris')
+  })
+
+  it('reads personal_notes and llm_notes as separate fields', () => {
+    expect(people.maria.personalNotes).toBe('Loves hearing about the latest build.')
+    expect(people.maria.llmNotes).toBe('Prefers calls in the afternoon.')
+    expect(people.sam.personalNotes).toBeUndefined()
   })
 
   it('derives id from name when id is omitted, and honors an explicit id', () => {

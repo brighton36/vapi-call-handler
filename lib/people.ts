@@ -3,7 +3,7 @@ import type { People, PersonFileEntry, Person } from './types'
 
 // The resolved profile for a personal line. From the file it's a full
 // PersonFileEntry; from Dynamo it's a Person (no `numbers`). Union of both.
-export type ResolvedPerson = (PersonFileEntry & Partial<Pick<Person, 'profile' | 'followUps'>>)
+export type ResolvedPerson = (PersonFileEntry & Partial<Pick<Person, 'followUps'>>)
   | (Person & { numbers?: string[] })
 
 export interface Resolution {
@@ -27,7 +27,8 @@ export interface YamlPerson {
   my_name?: string
   relationship?: string
   phone_numbers?: string[]
-  notes?: string
+  personal_notes?: string
+  llm_notes?: string
   follow_ups?: string
 }
 
@@ -47,6 +48,8 @@ export function parsePeopleYaml(text: string): People {
       myName: p.my_name ?? 'Chris',
       relationship: p.relationship,
       numbers: p.phone_numbers ?? [],
+      personalNotes: p.personal_notes,
+      llmNotes: p.llm_notes,
     }
   }
   return out
@@ -91,9 +94,17 @@ export function resolveFromPeopleFile(people: People, number: string): Resolutio
 
 export function fromPersonDynamo(item: Record<string, any>): Person {
   const out: Person = { id: item.id?.S }
-  for (const k of ['name', 'myName', 'relationship', 'profile', 'followUps', 'lastCalled']) {
+  for (const k of ['name', 'myName', 'relationship', 'personalNotes', 'llmNotes', 'followUps', 'lastCalled']) {
     if (item[k]?.S !== undefined) (out as any)[k] = item[k].S
   }
+  // pre-rename rows: a legacy `profile` attribute is the old personal notes.
+  if (out.personalNotes === undefined && item.profile?.S !== undefined) out.personalNotes = item.profile.S
   if (item.calls?.N !== undefined) out.calls = Number(item.calls.N)
+  for (const k of ['callsLast24h', 'callsLast7d', 'callsLast30d'] as const) {
+    if (item[k]?.N !== undefined) out[k] = Number(item[k].N)
+  }
+  if (Array.isArray(item.recentCalls?.L)) {
+    out.recentCalls = item.recentCalls.L.map((v: any) => v.S).filter(Boolean)
+  }
   return out
 }

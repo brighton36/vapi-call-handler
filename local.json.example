@@ -1,4 +1,5 @@
 {
   "vapiMobileNumberId": "00000000-0000-0000-0000-000000000000",
-  "vapiAssistantId": "00000000-0000-0000-0000-000000000000"
+  "vapiAssistantId": "00000000-0000-0000-0000-000000000000",
+  "fallbackNumber": "+1XXXXXXXXXX"
 }

@@ -1,9 +1,9 @@
 # vapi-call-handler
 
-> **This repo is public** — everything committed here (code, README, and
-> `people.yaml`) is visible on GitHub. No real names, phone numbers, or
-> other PII may be committed. Real data lives only in local, gitignored
-> files (`local.json`) and the live AWS/Vapi services.
+> **This repo is public** — everything committed here is visible on GitHub.
+> No real names, phone numbers, secrets, or other PII may be committed. Real
+> data lives only in gitignored local files (`people.yaml`, `local.json`,
+> `secrets.json`) and the live AWS/Vapi services.
 
 Routes inbound calls on Chris's personal Vapi number so the assistant knows
 who's calling — and eventually what they've talked about before.
@@ -12,8 +12,8 @@ who's calling — and eventually what they've talked about before.
   name + which name to use ("Chris" vs "David"), and archives every
   `end-of-call-report` (transcript + messages) to S3, indexed by person.
 - **Phase 3 (not built):** after each call, a summarizer rewrites the
-  person's profile/follow-ups so the next call can pick up where the last
-  left off.
+  person's llm notes + follow-ups so the next call can pick up where the
+  last left off. Your personal notes are never touched by the LLM.
 
 ## People model
 
@@ -28,9 +28,9 @@ DynamoDB tables:
 
 | Table | Key | Meaning |
 |---|---|---|
-| `People` | `id` (slug, e.g. `maria`) | the profile: name, myName, relationship, profile, followUps, calls, lastCalled |
+| `People` | `id` (slug, e.g. `maria`) | the profile: name, myName, relationship, personalNotes, llmNotes, followUps, calls, lastCalled |
 | `NumberIndex` | `number` (E.164) | incoming number → `people[]` (the people who use that line) |
-| `CallIndex` | `callId`, GSI `ByPerson(personId, startedAt)` | one row per call; `bin/vapi.py calls --person maria` is this GSI, newest first |
+| `CallIndex` | `callId`, GSI `ByPerson(personId, startedAt)` | one row per call — a person **has many** calls via this GSI. Each row: `startedAt`, `endedAt`, `durationSeconds`, `number`, `cost`, `endedReason`, `llmNotes` (phase 3). `bin/vapi.py calls --person maria` lists them newest first |
 
 S3 (`CallLogs` bucket) is the raw archive: `calls/<YYYY-MM-DD>/<callId>.json`
 with the full transcript + message array. CallIndex is the queryable view
@@ -55,12 +55,21 @@ SST v4 → us-west-2 (Vapi's docs say to host the webhook near us-west-2;
 - `functions/api.ts` — the webhook (Lambda with a public Function URL).
   - `assistant-request`: number → NumberIndex → People (one batch read,
     ~10ms) → `assistantOverrides.variableValues`.
-  - `end-of-call-report`: archive to S3 + index row in CallIndex.
+  - `end-of-call-report`: archive to S3 + index row in CallIndex (with
+    start/end time and duration). Redelivered reports are ignored
+    (conditional put).
+- `functions/after-call.ts` — the deferred after-call job, fired by the
+  CallIndex DynamoDB stream on each new call row. Recomputes the caller's
+  call frequency (last 24h / 7d / 30d) from the ByPerson GSI and stores it
+  on their People row (`callsLast24h`, `callsLast7d`, `callsLast30d`,
+  `recentCalls`, `lastCalled`). The phase-3 summarizer will live here too.
+  The webhook re-buckets `recentCalls` against the current time when a call
+  comes in, so the counts decay correctly even between calls.
 - `lib/vapi.ts` — number extraction (E.164 or `sip:+1...@host`), auth
   guard, timing wrapper (warns at >3.75s of the 7.5s budget).
 - `lib/people.ts` — pure resolution logic (file + Dynamo paths), testable.
 - `lib/types.ts` — Vapi payload + Person/CallIndexItem/CallLog shapes.
-- `people.yaml` — **the source of truth for the database**, an array of
+- `people.yaml` (gitignored) — **the source of truth for the database**, an array of
   people (see "Managing the database"). Bundled into the Lambda as the
   webhook's fallback when Dynamo is unreachable.
 - `bin/vapi.py` — local CLI (no GUI): people CRUD, line management,
@@ -69,7 +78,8 @@ SST v4 → us-west-2 (Vapi's docs say to host the webhook near us-west-2;
 
 ## Managing the database (YAML)
 
-`people.yaml` is the database. Each entry is a person:
+`people.yaml` (gitignored — your real data) is the database; `people.example.yaml`
+is the committed, fictional sample. Each entry is a person:
 
 ```yaml
 people:
@@ -80,9 +90,15 @@ people:
     phone_numbers:     # every line they call from
       - "+15550123400"
       - "+15550123401"
-    notes: "Loves hearing about the build."        # seeded by hand, then LLM-maintained
-    follow_ups: "Milo has a vet appointment."
+    personal_notes: "Loves hearing about the build."   # hand-edited by you; the LLM never touches it
+    llm_notes: "Prefers calls in the afternoon."       # maintained by the phase-3 summarizer
+    follow_ups: "Ask how the garden is doing."
 ```
+
+Two notes fields on purpose: `personal_notes` is yours — the LLM is never
+allowed to write it — and `llm_notes` is what the phase-3 summarizer
+rewrites from call history. `{{callerNotes}}` feeds the prompt all of
+personal notes + llm notes + follow-ups.
 
 If two people list the same number it becomes a **shared line**.
 
@@ -102,28 +118,34 @@ bin/vapi.py edit     # pull, open $EDITOR, and commit your edits back
 `calls`/`lastCalled` are owned by the webhook and the phase-3 summarizer, so
 `sync` preserves them and the file doesn't carry them.
 
-**The committed file is a fictional sample.** After `pull`/`edit` your local
-copy contains your real data — never commit it back. Keep the real names and
-numbers out of git (this is a public repo); `sync`/`pull` talk to live
-Dynamo directly, so nothing sensitive needs to pass through a commit.
+`people.yaml` is gitignored, so `pull`/`edit` can't leak real data into
+the public repo. The webhook bundles it as its Dynamo-down fallback (or the
+sample, on a checkout without one).
 
 ## Setup
 
 ```sh
 npm install
+npm install-scripts approve esbuild   # if npm blocked esbuild's postinstall
 pip install boto3 requests pyyaml
-cp local.json.example local.json   # then fill in the number + assistant IDs
-export VAPI_TOKEN=...            # your Vapi private API key
-export VAPI_WEBHOOK_SECRET=$(openssl rand -hex 24)
-npx sst deploy
+cp local.json.example local.json       # Vapi number/assistant IDs + fallbackNumber (your cell)
+cp secrets.json.example secrets.json   # vapiToken + vapiWebhookSecret (openssl rand -hex 24)
+cp people.example.yaml people.yaml     # then replace the sample with your real people
+npx sst deploy --stage production      # writes .sst/outputs.json
 bin/vapi.py sync                 # seed live Dynamo from people.yaml
-bin/vapi.py vapi sync --url <Function URL from npx sst output>
+bin/vapi.py vapi sync            # point the number at the webhook (url read from outputs.json)
 ```
+
+All three local files are gitignored. `secrets.json` is read by both
+`sst.config.ts` (the webhook secret goes into the Lambda's environment at
+deploy) and `bin/vapi.py` (Vapi API token, and the same webhook secret for
+`vapi sync`) — no env vars, no `sst secret`.
 
 `local.json` (gitignored) holds the two Vapi identifiers — your personal
 phone number's ID and the Mobile Call Screener assistant ID — from the Vapi
-dashboard (Numbers / Assistants pages). `sst.config.ts` reads the assistant
-ID from it at deploy time; `bin/vapi.py` reads the number ID for the
+dashboard (Numbers / Assistants pages), plus `fallbackNumber`, where calls
+are forwarded if the webhook fails. `sst.config.ts` reads the assistant
+ID from it at deploy time; `bin/vapi.py` reads the rest for the
 `vapi show` / `vapi sync` commands.
 
 `vapi sync` sets, on the Mobile number only:
@@ -146,6 +168,11 @@ Mobile Call Screener assistant needs a prompt that references them
 - `{{callerNotes}}` — phase 3; empty for now
 - `{{callerSharedWith}}` — "Ruth, Noah" for a shared line (everyone who
   uses it); the prompt should say "ask who's speaking" when this is set
+- `{{callerCallFrequency}}` — e.g. "2 calls in the last 24 hours, 3 in the
+  last week, 5 in the last month"; blank if they haven't called in 30 days.
+  Also as numbers: `{{callerCallsLast24h}}`, `{{callerCallsLast7d}}`,
+  `{{callerCallsLast30d}}`. Lets the assistant notice "you've been calling a
+  lot lately".
 
 ## Behavior / fallbacks
 
@@ -176,7 +203,7 @@ bin/vapi.py line add  +15550123403 ruth noah   # make a line shared
 bin/vapi.py calls --days 7            # recent calls
 bin/vapi.py calls --person maria        # everything we've discussed with maria
 bin/vapi.py call <callId>             # full archive (transcript + messages)
-npx sst output                        # Function URL, table/bucket names
+cat .sst/outputs.json                 # Function URL, table/bucket names (written by deploy)
 ```
 
 Tests: `npx vitest run` (no AWS needed — pure resolution logic only).
@@ -186,6 +213,6 @@ Tests: `npx vitest run` (no AWS needed — pure resolution logic only).
 - [ ] Phase 1: write assistant instructions with the `{{...}}` slots
       (dashboard or via Vapi API); test calls from an unknown, a known,
       and (eventually) a shared line; verify S3 + CallIndex.
-- [ ] Phase 3: `end-of-call-report` → SQS → summarizer Lambda (LLM rewrites
-      `People.profile`/`followUps`, backfills `CallIndex.summary`, bumps
-      `calls`/`lastCalled`) → `{{callerNotes}}`.
+- [ ] Phase 3: `end-of-call-report` → SQS → summarizer Lambda (LLM writes
+      the call's `CallIndex.llmNotes`, then rewrites `People.llmNotes`/
+      `followUps` — never `personalNotes`) → `{{callerNotes}}`.

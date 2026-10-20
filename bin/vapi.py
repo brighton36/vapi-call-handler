@@ -6,19 +6,22 @@ index, call archive) using your default AWS profile. No GUI — this is the
 whole CRUD story.
 
 Data model: the unit of memory is the PERSON, not the phone number.
-  People table        id (slug)    -> name, myName, relationship, profile, ...
+  People table        id (slug)    -> name, myName, relationship, personalNotes,
+                                      llmNotes, followUps, ...
   NumberIndex table   E.164 number -> people[]  (1 person = personal line,
                                                 >1 = shared line)
   CallIndex table     callId       -> personId, number, startedAt, ...  (GSI ByPerson)
   S3 CallLogs         calls/<date>/<callId>.json  (raw transcript + messages)
 
-Requires: VAPI_TOKEN in env, and boto3+requests (pip install boto3 requests).
+Requires: secrets.json (vapiToken, vapiWebhookSecret) and local.json in the repo
+root — both gitignored, see the *.example files — plus boto3, requests, pyyaml.
 
 Usage:
   bin/vapi.py people                          # list people
   bin/vapi.py add maria Maria --my-name David --relationship mom --number +15550123400
   bin/vapi.py add-number maria +15550123401     # another line for the same person
-  bin/vapi.py update maria --notes "Milo has a vet appt the 22nd"
+  bin/vapi.py update maria --notes "Milo has a vet appt the 22nd"   # personal notes
+  bin/vapi.py update maria --llm-notes "..."                        # the LLM-maintained notes
   bin/vapi.py rm maria
   bin/vapi.py line show +15550123403          # who uses this line
   bin/vapi.py line add +15550123403 ruth noah   # make it a shared line
@@ -60,7 +63,10 @@ YAML_HEADER = """\
 #   phone_numbers: every line this person calls from. If TWO people list the
 #                  same line, it becomes a shared line — the assistant greets
 #                  generically and asks who's speaking
-#   notes:         durable facts about them
+#   personal_notes: durable facts, hand-edited by you. The LLM / phase-3
+#                   summarizer never touches this.
+#   llm_notes:      notes the phase-3 summarizer maintains from call history.
+#                   Hand-editable; omit the key to keep the live value.
 #   follow_ups:    things to bring up on the next call
 #
 # This repo is PUBLIC — the committed people.yaml is a fictional sample.
@@ -72,6 +78,7 @@ API = "https://api.vapi.ai"
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PEOPLE_YAML = os.path.join(REPO, "people.yaml")
 LOCAL_JSON = os.path.join(REPO, "local.json")
+SECRETS_JSON = os.path.join(REPO, "secrets.json")
 
 
 def read_local():
@@ -89,6 +96,18 @@ def read_local():
     return cfg
 
 
+def read_secrets():
+    """Vapi token + webhook secret from gitignored secrets.json (same file
+    sst.config.ts reads at deploy)."""
+    try:
+        with open(SECRETS_JSON) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        sys.exit("secrets.json is missing (see secrets.json.example)")
+    except json.JSONDecodeError as e:
+        sys.exit(f"secrets.json is not valid JSON: {e}")
+
+
 def slugify(name):
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "unknown"
 
@@ -101,9 +120,9 @@ def e164(num):
 # ------------------------------------------------------------------ clients
 
 def vapi_token():
-    token = os.environ.get("VAPI_TOKEN")
+    token = read_secrets().get("vapiToken")
     if not token:
-        sys.exit("VAPI_TOKEN is not set in the environment")
+        sys.exit("secrets.json has no vapiToken")
     return token
 
 
@@ -131,18 +150,20 @@ def s3():
 
 
 def _outputs():
-    import subprocess
-    out = subprocess.run(
-        ["npx", "sst", "output", "--stage", "production", "--json"],
-        capture_output=True, text=True, cwd=REPO,
-    )
-    if out.returncode != 0:
-        sys.exit("sst output failed — run `npx sst deploy` first:\n" + out.stderr[-500:])
-    return json.loads(out.stdout)["sst"]
+    # SST v4 writes the run() return value here on every deploy.
+    path = os.path.join(REPO, ".sst", "outputs.json")
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        sys.exit(f"{path} not found — run `npx sst deploy --stage production` first")
 
 
 def T(name):
-    return _outputs()[name]["physical"]["name"]
+    out = _outputs()
+    if name not in out:
+        sys.exit(f"'{name}' missing from .sst/outputs.json — redeploy")
+    return out[name]
 
 
 def scan_all(client, table):
@@ -263,8 +284,14 @@ def cmd_people(_a):
               f"nums={', '.join(person_nums) or '-'}")
         if person_nums_shared:
             print(f"    shared lines: {', '.join(person_nums_shared)}")
-        if g("profile"):
-            print(f"    profile:   {g('profile')[:100]}")
+        n = lambda k: it.get(k, {}).get("N")
+        if n("callsLast30d"):
+            print(f"    calls: {n('callsLast24h') or 0} / 24h, {n('callsLast7d') or 0} / 7d, "
+                  f"{n('callsLast30d')} / 30d  (as of {g('frequencyUpdatedAt')[:16]})")
+        if g("personalNotes"):
+            print(f"    personalNotes: {g('personalNotes')[:100]}")
+        if g("llmNotes"):
+            print(f"    llmNotes:      {g('llmNotes')[:100]}")
         if g("followUps"):
             print(f"    followUps: {g('followUps')[:100]}")
 
@@ -273,7 +300,7 @@ def cmd_add(a):
     slug = slugify(a.name)
     if read_person(slug):
         sys.exit(f"person {slug} already exists (use update / add-number)")
-    write_person(slug, name=a.name, myName=a.my_name, relationship=a.relationship, profile=a.notes)
+    write_person(slug, name=a.name, myName=a.my_name, relationship=a.relationship, personalNotes=a.notes)
     print(f"added person {slug} ({a.name})")
     for num in a.number or []:
         attach_number(slug, num)
@@ -293,7 +320,8 @@ def cmd_update(a):
         "name": a.name or person.get("name", {}).get("S"),
         "myName": a.my_name or person.get("myName", {}).get("S"),
         "relationship": a.relationship or person.get("relationship", {}).get("S"),
-        "profile": a.notes if a.notes is not None else person.get("profile", {}).get("S"),
+        "personalNotes": a.notes if a.notes is not None else person.get("personalNotes", {}).get("S"),
+        "llmNotes": a.llm_notes if a.llm_notes is not None else person.get("llmNotes", {}).get("S"),
         "followUps": a.follow_ups if a.follow_ups is not None else person.get("followUps", {}).get("S"),
         "lastCalled": person.get("lastCalled", {}).get("S"),
         "calls": int(person["calls"]["N"]) if person.get("calls") else None,
@@ -367,8 +395,12 @@ def live_people():
         nums = sorted(numbers_by_id.get(pid, []))
         if nums:
             entry["phone_numbers"] = nums
-        if g("profile"):
-            entry["notes"] = g("profile")
+        if g("personalNotes"):
+            entry["personal_notes"] = g("personalNotes")
+        elif g("profile"):  # pre-rename rows: migrate legacy `profile`
+            entry["personal_notes"] = g("profile")
+        if g("llmNotes"):
+            entry["llm_notes"] = g("llmNotes")
         if g("followUps"):
             entry["follow_ups"] = g("followUps")
         out.append(entry)
@@ -422,12 +454,20 @@ def sync_file_to_live():
     #    calls/lastCalled are owned by the webhook/summarizer, so preserved.
     for slug, e in file_slugs.items():
         existing = read_person(slug)
+        # pre-rename rows: legacy `profile` becomes personalNotes. PutItem
+        # replaces the whole item, so the stale attribute is dropped for free.
+        personal_notes = e.get("personal_notes") or ""
+        if not personal_notes and (existing or {}).get("profile"):
+            personal_notes = existing["profile"]["S"]
         write_person(
             slug,
             name=e.get("name"),
             myName=e.get("my_name") or "Chris",
             relationship=e.get("relationship") or "",
-            profile=e.get("notes") or "",
+            personalNotes=personal_notes,
+            # llm_notes is summarizer-owned: omitted from the file -> keep the
+            # live value, so a stale file can't wipe what the LLM wrote.
+            llmNotes=e["llm_notes"] if "llm_notes" in e else (existing or {}).get("llmNotes", {}).get("S"),
             followUps=e.get("follow_ups") or "",
             lastCalled=(existing or {}).get("lastCalled", {}).get("S"),
             calls=int((existing or {}).get("calls", {}).get("N", "0")) if (existing or {}).get("calls") else None,
@@ -532,10 +572,12 @@ def cmd_calls(a):
         print(f"--- last {a.days} days: {len(rows)} call(s) ---")
     for it in rows:
         g = lambda k: it.get(k, {}).get("S", "")
-        print(f"{it['startedAt']['S'][:16]}  {g('number'):<14} {g('personId') or 'unknown':<10} "
+        dur = it.get("durationSeconds", {}).get("N")
+        dur_s = f"{int(dur) // 60}m{int(dur) % 60:02d}s" if dur else "?"
+        print(f"{it['startedAt']['S'][:16]}  {dur_s:>7}  {g('number'):<14} {g('personId') or 'unknown':<10} "
               f"${it.get('cost', {}).get('N', '0'):<8} {g('endedReason')}")
-        if g("summary"):
-            print(f"    {g('summary')[:140]}")
+        if g("llmNotes"):
+            print(f"    {g('llmNotes')[:140]}")
     if not rows:
         print("(no matching calls)")
 
@@ -558,12 +600,15 @@ def cmd_vapi_show(_a):
 
 
 def cmd_vapi_sync(a):
-    url = a.url
-    secret = a.secret or os.environ.get("VAPI_WEBHOOK_SECRET")
+    url = a.url or _outputs().get("url")
+    secret = a.secret or read_secrets().get("vapiWebhookSecret")
     if not url:
-        sys.exit("need --url (the Function URL from `npx sst output`)")
+        sys.exit("need --url (the Function URL, `url` in .sst/outputs.json after deploy)")
     if not secret:
-        sys.exit("need --secret or VAPI_WEBHOOK_SECRET in env")
+        sys.exit("need --secret or vapiWebhookSecret in secrets.json")
+    fallback = a.fallback_number or read_local().get("fallbackNumber")
+    if not fallback or not re.fullmatch(r"\+\d{8,15}", fallback):
+        sys.exit("need a real E.164 fallback: --fallback-number or fallbackNumber in local.json")
     body = {
         "server": {
             "url": url,
@@ -572,7 +617,7 @@ def cmd_vapi_sync(a):
         },
         "fallbackDestination": {
             "type": "number",
-            "number": a.fallback_number,
+            "number": fallback,
             "message": "",
         },
     }
@@ -594,7 +639,7 @@ def main():
     a.add_argument("name", help="display name (slug is derived)")
     a.add_argument("--my-name", help='"Chris" or "David"')
     a.add_argument("--relationship")
-    a.add_argument("--notes")
+    a.add_argument("--notes", help="personal notes (hand-edited; the LLM never writes these)")
     a.add_argument("--number", action="append", help="line they call from (repeatable)")
     a.set_defaults(fn=cmd_add)
 
@@ -608,7 +653,8 @@ def main():
     u.add_argument("--name")
     u.add_argument("--my-name")
     u.add_argument("--relationship")
-    u.add_argument("--notes")
+    u.add_argument("--notes", help="personal notes (hand-edited; the LLM never writes these)")
+    u.add_argument("--llm-notes", help="the LLM-maintained notes")
     u.add_argument("--follow-ups")
     u.set_defaults(fn=cmd_update)
 
@@ -648,7 +694,7 @@ def main():
     s_ = vsub.add_parser("sync")
     s_.add_argument("--url")
     s_.add_argument("--secret")
-    s_.add_argument("--fallback-number", default="+15550123409")
+    s_.add_argument("--fallback-number", help="defaults to fallbackNumber in local.json")
     s_.set_defaults(fn=cmd_vapi_sync)
 
     args = p.parse_args()

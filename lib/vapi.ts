@@ -6,11 +6,26 @@ import type { AssistantRequestPayload } from './types'
 // check so a future edit (a second DB read, an outbound fetch) gets flagged.
 export const ASSISTANT_REQUEST_BUDGET_MS = 7500
 
+// Lambda Function URL events wrap the HTTP body as a string (base64 when
+// isBase64Encoded). Return the parsed Vapi payload; pass through an
+// already-parsed object (tests, direct invokes). Bad JSON -> {}.
+export function parseWebhookBody(event: any): any {
+  if (!event || typeof event !== 'object') return {}
+  if (event.message) return event
+  if (typeof event.body !== 'string') return {}
+  try {
+    const raw = event.isBase64Encoded ? Buffer.from(event.body, 'base64').toString('utf8') : event.body
+    return JSON.parse(raw)
+  } catch {
+    return {}
+  }
+}
+
 export function timingMiddleware(handler: (event: any) => Promise<any>) {
   return async (event: any) => {
     const start = Date.now()
     const response = await handler(event)
-    const type = event?.message?.type
+    const type = parseWebhookBody(event)?.message?.type
     const ms = Date.now() - start
     if (type === 'assistant-request' && ms > ASSISTANT_REQUEST_BUDGET_MS / 2) {
       console.warn(`assistant-request slow path: ${ms}ms (budget ${ASSISTANT_REQUEST_BUDGET_MS}ms)`)
@@ -32,6 +47,14 @@ export function extractCallerNumber(payload: AssistantRequestPayload): string | 
   // Last resort: whatever digits are in there.
   const digits = raw.replace(/[^\d+]/g, '')
   return /^\+\d{7,15}$/.test(digits) ? digits : null
+}
+
+// Whole seconds between two ISO timestamps, or undefined if either is
+// missing/unparseable or the span is negative.
+export function callDurationSeconds(startedAt?: string, endedAt?: string): number | undefined {
+  if (!startedAt || !endedAt) return undefined
+  const ms = Date.parse(endedAt) - Date.parse(startedAt)
+  return Number.isFinite(ms) && ms >= 0 ? Math.round(ms / 1000) : undefined
 }
 
 // Timing-safe string comparison.
