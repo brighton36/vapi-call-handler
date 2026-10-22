@@ -1,8 +1,8 @@
-import { describe, it, expect } from 'vitest'
-import { timingMiddleware, extractCallerNumber, callDurationSeconds, parseWebhookBody } from '../lib/vapi'
+import { describe, it, expect, afterEach } from 'vitest'
+import { timingMiddleware, extractCallerNumber, callDurationSeconds, parseWebhookBody, authGuard } from '../lib/vapi'
 import { computeFrequency, describeFrequency } from '../lib/frequency'
 import { personIdsFromStream } from '../functions/after-call'
-import { resolveFromPeopleFile, parsePeopleYaml, slugify } from '../lib/people'
+import { resolveFromPeopleFile, parsePeopleYaml, slugify, fullName } from '../lib/people'
 import { readFileSync } from 'node:fs'
 import type { People } from '../lib/types'
 
@@ -106,20 +106,20 @@ describe('resolveFromPeopleFile', () => {
   it('resolves a personal number to that person', () => {
     const r = resolveFromPeopleFile(people, '+15550123400')
     expect(r.personIds).toEqual(['maria'])
-    expect(r.person?.name).toBe('Maria')
+    expect(fullName(r.person!)).toBe('Maria Sample')
     expect(r.person?.myName).toBe('David')
   })
 
   it('returns no people for an unknown number', () => {
-    const r = resolveFromPeopleFile(people, '+10000000000')
+    const r = resolveFromPeopleFile(people, '+1000000000')
     expect(r.personIds).toEqual([])
     expect(r.person).toBeNull()
   })
 
   it('treats a number used by two people as a shared line', () => {
     const two: People = {
-      ruth: { name: 'Ruth', myName: 'Chris', numbers: ['+18005551234'] },
-      noah: { name: 'Noah', myName: 'Chris', numbers: ['+18005551234'] },
+      ruth: { firstName: 'Ruth', myName: 'Chris', numbers: ['+18005551234'] },
+      noah: { firstName: 'Noah', myName: 'Chris', numbers: ['+18005551234'] },
     }
     const r = resolveFromPeopleFile(two, '+18005551234')
     expect(r.personIds).toHaveLength(2)
@@ -130,7 +130,7 @@ describe('resolveFromPeopleFile', () => {
 
   it('a person with two numbers resolves from either one', () => {
     const multi: People = {
-      maria: { name: 'Maria', myName: 'David', numbers: ['+15550123400', '+15550123401'] },
+      maria: { firstName: 'Maria', lastName: 'DeRose', myName: 'David', numbers: ['+15550123400', '+15550123401'] },
     }
     expect(resolveFromPeopleFile(multi, '+15550123401').personIds).toEqual(['maria'])
     expect(resolveFromPeopleFile(multi, '+15550123400').personIds).toEqual(['maria'])
@@ -159,21 +159,44 @@ describe('parsePeopleYaml', () => {
     expect(people.sam.personalNotes).toBeUndefined()
   })
 
-  it('derives id from name when id is omitted, and honors an explicit id', () => {
+  it('reads the per-person attitude (sample: warm for maria, unset for sam)', () => {
+    expect(people.maria.attitude).toBe('warm')
+    expect(people.sam.attitude).toBeUndefined()
+  })
+
+  it('derives id from the full name when id is omitted, and honors an explicit id', () => {
     const doc = `
 people:
-  - name: Sophie
+  - first_name: Sophie
     my_name: Chris
     phone_numbers: ["+15550123404"]
+  - first_name: Jane
+    last_name: Doe
+    my_name: Chris
+    phone_numbers: []
   - id: custom-slug
-    name: Someone
+    first_name: Some
+    last_name: One
     my_name: Chris
     phone_numbers: []
 `
     const p = parsePeopleYaml(doc)
-    expect(Object.keys(p).sort()).toEqual(['custom-slug', 'sophie'])
-    expect(p.sophie.name).toBe('Sophie')
-    expect(p['custom-slug'].name).toBe('Someone')
+    expect(Object.keys(p).sort()).toEqual(['custom-slug', 'jane-doe', 'sophie'])
+    expect(fullName(p.sophie)).toBe('Sophie')
+    expect(fullName(p['jane-doe'])).toBe('Jane Doe')
+    expect(fullName(p['custom-slug'])).toBe('Some One')
+  })
+
+  it('still accepts a legacy single `name` field', () => {
+    const doc = `
+people:
+  - name: Legacy Person
+    my_name: Chris
+    phone_numbers: []
+`
+    const p = parsePeopleYaml(doc)
+    expect(p['legacy-person'].firstName).toBe('Legacy Person')
+    expect(fullName(p['legacy-person'])).toBe('Legacy Person')
   })
 
   it('returns an empty map for a file with no people', () => {
@@ -186,5 +209,70 @@ describe('timingMiddleware', () => {
   it('passes the response through unchanged', async () => {
     const handler = timingMiddleware(async () => ({ statusCode: 200, body: 'ok' }))
     await expect(handler({})).resolves.toEqual({ statusCode: 200, body: 'ok' })
+  })
+})
+
+describe('authGuard', () => {
+  const SECRET = 'test-secret-123'
+  const orig = process.env.VAPI_WEBHOOK_SECRET
+  const handler = authGuard(async () => ({ statusCode: 200, body: JSON.stringify({ ok: true }) }))
+
+  afterEach(() => {
+    process.env.VAPI_WEBHOOK_SECRET = orig
+  })
+
+  it('accepts Authorization: Bearer *** (custom credential format)', async () => {
+    process.env.VAPI_WEBHOOK_SECRET = SECRET
+    const r = await handler({ headers: { authorization: `Bearer ${SECRET}` }, body: '{}' } as any)
+    expect(r.statusCode).toBe(200)
+    expect(JSON.parse(r.body)).toEqual({ ok: true })
+  })
+
+  it('accepts the legacy x-vapi-webhook-secret header (migration window)', async () => {
+    process.env.VAPI_WEBHOOK_SECRET = SECRET
+    const r = await handler({ headers: { 'x-vapi-webhook-secret': SECRET }, body: '{}' } as any)
+    expect(r.statusCode).toBe(200)
+  })
+
+  it('is case-insensitive on header names', async () => {
+    process.env.VAPI_WEBHOOK_SECRET = SECRET
+    const r = await handler({ headers: { Authorization: `Bearer ${SECRET}` }, body: '{}' } as any)
+    expect(r.statusCode).toBe(200)
+  })
+
+  it('rejects a wrong bearer token with 401', async () => {
+    process.env.VAPI_WEBHOOK_SECRET = SECRET
+    const r = await handler({ headers: { authorization: 'Bearer wrong' }, body: '{}' } as any)
+    expect(r.statusCode).toBe(401)
+  })
+
+  it('rejects a missing/empty bearer prefix or token', async () => {
+    process.env.VAPI_WEBHOOK_SECRET = SECRET
+    expect((await handler({ headers: { authorization: SECRET }, body: '{}' } as any)).statusCode).toBe(401)
+    expect((await handler({ headers: { authorization: 'Bearer ' }, body: '{}' } as any)).statusCode).toBe(401)
+    expect((await handler({ headers: {}, body: '{}' } as any)).statusCode).toBe(401)
+    expect((await handler({} as any)).statusCode).toBe(401)
+  })
+
+  it('rejects when headers and the secret disagree (no mixing)', async () => {
+    process.env.VAPI_WEBHOOK_SECRET = SECRET
+    // legacy header has the right secret, but the Authorization header wins
+    // when present — a wrong bearer must not be papered over by a legacy hit.
+    const r = await handler({
+      headers: { authorization: `Bearer ${SECRET}`, 'x-vapi-webhook-secret': 'stale' },
+      body: '{}',
+    } as any)
+    expect(r.statusCode).toBe(200)
+    const r2 = await handler({
+      headers: { authorization: 'Bearer wrong', 'x-vapi-webhook-secret': SECRET },
+      body: '{}',
+    } as any)
+    expect(r2.statusCode).toBe(401)
+  })
+
+  it('fails closed (500) when VAPI_WEBHOOK_SECRET is not configured', async () => {
+    delete process.env.VAPI_WEBHOOK_SECRET
+    const r = await handler({ headers: { authorization: `Bearer ${SECRET}` }, body: '{}' } as any)
+    expect(r.statusCode).toBe(500)
   })
 })

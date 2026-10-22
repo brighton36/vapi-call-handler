@@ -17,30 +17,28 @@ Requires: secrets.json (vapiToken, vapiWebhookSecret) and local.json in the repo
 root — both gitignored, see the *.example files — plus boto3, requests, pyyaml.
 
 Usage:
-  bin/vapi.py people                          # list people
-  bin/vapi.py add maria Maria --my-name David --relationship mom --number +15550123400
-  bin/vapi.py add-number maria +15550123401     # another line for the same person
-  bin/vapi.py update maria --notes "Milo has a vet appt the 22nd"   # personal notes
-  bin/vapi.py update maria --llm-notes "..."                        # the LLM-maintained notes
-  bin/vapi.py rm maria
-  bin/vapi.py line show +15550123403          # who uses this line
-  bin/vapi.py line add +15550123403 ruth noah   # make it a shared line
-  bin/vapi.py line rm  +15550123403 noah       # remove noah from the line
-  bin/vapi.py pull                      # write live Dynamo -> people.yaml
-  bin/vapi.py sync                      # push people.yaml -> live Dynamo (authoritative)
-  bin/vapi.py edit                      # pull, open $EDITOR, commit edits back
-  bin/vapi.py calls --days 7                  # recent calls (overall)
-  bin/vapi.py calls --person maria              # everything we've discussed with maria
-  bin/vapi.py call <callId>                   # full archive file for one call
-  bin/vapi.py vapi show                       # current phone number config
-  bin/vapi.py vapi sync --url <webhook>       # point number at the deployed webhook
+  bin/vapi.py people                    # list people
+  bin/vapi.py rm maria                  # delete a person (their lines drop too)
+  bin/vapi.py dump                      # live Dynamo -> people.yaml on STDOUT
+                                          #   (save it: `bin/vapi.py dump > people.yaml`)
+  bin/vapi.py push people.yaml          # push that YAML file -> live Dynamo (authoritative)
+  bin/vapi.py edit                      # dump live, open $EDITOR, push edits back
+  bin/vapi.py calls --days 7            # recent calls (overall)
+  bin/vapi.py calls --person maria      # everything we've discussed with maria
+  bin/vapi.py call <callId>             # full archive file for one call
+  bin/vapi.py vapi show                 # current phone number config
+  bin/vapi.py vapi sync --url <webhook> # point number at the deployed webhook
+  bin/vapi.py logs --minutes 30         # last webhook CloudWatch log lines
+  bin/vapi.py logs --tail               # show recent, then follow new lines
 """
 import argparse
+import datetime
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 
 import requests
 import yaml
@@ -49,17 +47,21 @@ YAML_HEADER = """\
 # people.yaml — the seed and source of truth for the call-handler database.
 #
 # Managed via:
-#   bin/vapi.py pull     # write current live data into this file
-#   bin/vapi.py sync     # push this file into live Dynamo (authoritative)
-#   bin/vapi.py edit     # pull, open $EDITOR, and commit your edits back
+#   bin/vapi.py dump     # write current live data to stdout (`dump > people.yaml`)
+#   bin/vapi.py push <file>  # push that YAML file into live Dynamo (authoritative)
+#   bin/vapi.py edit     # dump live, open $EDITOR, and commit your edits back
 # The webhook also ships a copy of this file and falls back to it if Dynamo
 # is unreachable, so keep it in the repo.
 #
 # Fields per person:
-#   id:            optional slug; derived from name when omitted
-#   name:          display name (required)
+#   id:            optional slug; derived from the name when omitted
+#   first_name:    first name (required)
+#   last_name:     last name (optional)
 #   my_name:       which name to use when this person calls: Chris or David
 #   relationship:  free-form ("mom", "neighbor", "rabbi's wife")
+#   attitude:      the tone the assistant takes with them ("professional" by
+#                  default, or "warm", "chatty", ...). Omit to keep the
+#                  professional default.
 #   phone_numbers: every line this person calls from. If TWO people list the
 #                  same line, it becomes a shared line — the assistant greets
 #                  generically and asks who's speaking
@@ -169,7 +171,7 @@ def _outputs():
         r = cfn.describe_stacks(StackName=CFN_STACK)
     except Exception as e:
         sys.exit(f"cannot read stack '{CFN_STACK}': {e}")
-    if not r["Stacks"] or r["Stacks"][0]["StackStatus"] != "CREATE_COMPLETE":
+    if not r["Stacks"] or r["Stacks"][0]["StackStatus"] not in ("CREATE_COMPLETE", "UPDATE_COMPLETE"):
         status = r["Stacks"][0]["StackStatus"] if r["Stacks"] else "missing"
         sys.exit(f"stack '{CFN_STACK}' is not deployed yet (status: {status}) — run `npm run deploy`")
     out = {}
@@ -220,14 +222,22 @@ def read_number(number):
 
 
 def write_person(person_id, **fields):
-    item = {"id": s(person_id)}
+    item: dict = {"id": s(str(person_id).strip())}
     for k, v in fields.items():
         if v is None:
             continue
         if k == "calls":
             item[k] = {"N": str(v)}
         elif isinstance(v, list):
-            item[k] = {"L": [s(x) for x in v]}
+            # trim each element; drop ones that are empty after trimming
+            vals = [str(x).strip() for x in v]
+            if vals:
+                item[k] = {"L": [s(x) for x in vals]}
+        elif isinstance(v, str):
+            v = v.strip()
+            if not v:
+                continue
+            item[k] = s(v)
         else:
             item[k] = s(v)
     dynamo().put_item(TableName=T("People"), Item=item)
@@ -238,35 +248,9 @@ def number_people(item):
 
 
 def write_number(number, people):
-    item = {"number": s(number), "people": {"L": [s(p) for p in people]}}
+    slugs = [str(p).strip() for p in people if str(p).strip()]
+    item = {"number": s(str(number).strip()), "people": {"L": [s(p) for p in slugs]}}
     dynamo().put_item(TableName=T("NumberIndex"), Item=item)
-
-
-def line_exists(number):
-    return number in number_people(read_number(number))
-
-
-def set_line(number, people):
-    write_number(number, people)
-
-
-def attach_number(slug, number):
-    """Add a line to a person. A line is personal if only this person uses it;
-    if anyone else already uses it, add this person to the (now shared) list."""
-    n = e164(number)
-    people = number_people(read_number(n))
-    if not people:
-        write_number(n, [slug])
-        print(f"  -> {n} -> {slug}")
-        return
-    if slug in people:
-        print(f"  ! {slug} already on {n}; no change")
-        return
-    write_number(n, people + [slug])
-    if len(people) >= 1:
-        print(f"  -> {n} now shared: {', '.join(people + [slug])}")
-    else:
-        print(f"  -> {n} -> {slug}")
 
 
 def detach_number(slug, number):
@@ -291,10 +275,11 @@ def cmd_people(_a):
     rows = scan_all(ddb, T("People"))
     numrows = scan_all(ddb, T("NumberIndex"))
     if not rows:
-        print("(no people in Dynamo yet — run `bin/vapi.py sync`)")
+        print("(no people in Dynamo yet — run `bin/vapi.py push`)")
         return
     for it in sorted(rows, key=lambda x: x["id"]["S"]):
         g = lambda k: it.get(k, {}).get("S", "")
+        display = " ".join(x for x in (g("firstName"), g("lastName")) if x) or g("name") or it["id"]["S"]
         person_nums = [
             nr["number"]["S"] for nr in numrows if it["id"]["S"] in number_people(nr)
         ]
@@ -302,7 +287,7 @@ def cmd_people(_a):
             nr["number"]["S"] for nr in numrows
             if it["id"]["S"] in number_people(nr) and len(number_people(nr)) > 1
         ]
-        print(f"{it['id']['S']:<12} {g('name'):<14} my={g('myName') or '?':<6} "
+        print(f"{it['id']['S']:<12} {display:<18} my={g('myName') or '?':<6} "
               f"rel={g('relationship'):<10} calls={it.get('calls', {}).get('N', '0'):<3} "
               f"nums={', '.join(person_nums) or '-'}")
         if person_nums_shared:
@@ -319,40 +304,6 @@ def cmd_people(_a):
             print(f"    followUps: {g('followUps')[:100]}")
 
 
-def cmd_add(a):
-    slug = slugify(a.name)
-    if read_person(slug):
-        sys.exit(f"person {slug} already exists (use update / add-number)")
-    write_person(slug, name=a.name, myName=a.my_name, relationship=a.relationship, personalNotes=a.notes)
-    print(f"added person {slug} ({a.name})")
-    for num in a.number or []:
-        attach_number(slug, num)
-
-
-def cmd_add_number(a):
-    if not read_person(a.slug):
-        sys.exit(f"{a.slug} not found")
-    attach_number(a.slug, a.number)
-
-
-def cmd_update(a):
-    person = read_person(a.slug)
-    if not person:
-        sys.exit(f"{a.slug} not found")
-    d = {
-        "name": a.name or person.get("name", {}).get("S"),
-        "myName": a.my_name or person.get("myName", {}).get("S"),
-        "relationship": a.relationship or person.get("relationship", {}).get("S"),
-        "personalNotes": a.notes if a.notes is not None else person.get("personalNotes", {}).get("S"),
-        "llmNotes": a.llm_notes if a.llm_notes is not None else person.get("llmNotes", {}).get("S"),
-        "followUps": a.follow_ups if a.follow_ups is not None else person.get("followUps", {}).get("S"),
-        "lastCalled": person.get("lastCalled", {}).get("S"),
-        "calls": int(person["calls"]["N"]) if person.get("calls") else None,
-    }
-    write_person(a.slug, **d)
-    print(f"updated {a.slug}")
-
-
 def cmd_rm(a):
     if not read_person(a.slug):
         sys.exit(f"{a.slug} not found")
@@ -362,38 +313,6 @@ def cmd_rm(a):
             detach_number(a.slug, nr["number"]["S"])
     dynamo().delete_item(TableName=T("People"), Key={"id": s(a.slug)})
     print(f"removed {a.slug} (CallIndex rows kept as history)")
-
-
-def cmd_line(a):
-    n = e164(a.number)
-    if a.lcmd == "show":
-        people = number_people(read_number(n))
-        if not people:
-            print(f"{n}: no one mapped to this line yet")
-            return
-        kind = "shared" if len(people) > 1 else "personal"
-        print(f"{n} ({kind}): {', '.join(people)}")
-        return
-    if a.lcmd == "add":
-        # validate all the people exist
-        for p in a.people:
-            if not read_person(p):
-                sys.exit(f"person {p} not found — add them first")
-        existing = number_people(read_number(n))
-        updated = list(existing)
-        for p in a.people:
-            if p not in updated:
-                updated.append(p)
-        if not updated:
-            sys.exit(f"{n}: nothing to set")
-        write_number(n, updated)
-        kind = "shared" if len(updated) > 1 else "personal"
-        print(f"{n} ({kind}): {', '.join(updated)}")
-        return
-    if a.lcmd == "rm":
-        for p in a.people:
-            detach_number(p, n)
-        return
 
 
 # ------------------------------------------------------------------ YAML <-> Dynamo
@@ -412,9 +331,20 @@ def live_people():
     for it in sorted(people_rows, key=lambda x: x["id"]["S"]):
         pid = it["id"]["S"]
         g = lambda k: it.get(k, {}).get("S")
-        entry = {"id": pid, "name": g("name") or pid, "my_name": g("myName") or "Chris"}
+        first, last = g("firstName"), g("lastName")
+        # pre-rename rows only have `name`: surface it as first_name so the
+        # dump always yields the new shape.
+        if not first and g("name"):
+            first = g("name")
+        if not first:
+            first = pid
+        entry = {"id": pid, "first_name": first, "my_name": g("myName") or "Chris"}
+        if last:
+            entry["last_name"] = last
         if g("relationship"):
             entry["relationship"] = g("relationship")
+        if g("attitude"):
+            entry["attitude"] = g("attitude")
         nums = sorted(numbers_by_id.get(pid, []))
         if nums:
             entry["phone_numbers"] = nums
@@ -430,44 +360,68 @@ def live_people():
     return out
 
 
+def render_yaml(people):
+    """The full file (header + data) as a string. `dump` prints this to
+    stdout; `write_yaml` (used by `edit`) is the same bytes to a path."""
+    out = YAML_HEADER
+    if people:
+        out += yaml.safe_dump({"people": people}, sort_keys=False, default_flow_style=False)
+    else:
+        out += "people: []\n"
+    return out
+
+
 def write_yaml(path, people):
     with open(path, "w") as f:
-        f.write(YAML_HEADER)
-        if people:
-            f.write(yaml.safe_dump({"people": people}, sort_keys=False, default_flow_style=False))
-        else:
-            f.write("people: []\n")
+        f.write(render_yaml(people))
 
 
 def read_yaml(path):
-    """Parse people.yaml -> (list_of_entries). Each entry: id?, name, my_name, ..."""
+    """Parse the people YAML -> (list_of_entries). Each entry: id?, first_name, last_name?, ...
+    String values are stripped of leading/trailing whitespace here (and again
+    in the write paths), so whitespace can't reach Dynamo."""
     if not os.path.exists(path):
-        sys.exit(f"{path} not found — create it first, or run `bin/vapi.py pull`")
+        sys.exit(f"{path} not found — create it first, or run `bin/vapi.py dump > people.yaml`")
     with open(path) as f:
         doc = yaml.safe_load(f) or {}
     people = doc.get("people") or []
     clean = []
     for i, p in enumerate(people):
-        if not isinstance(p, dict) or not p.get("name"):
-            sys.exit(f"people[{i}] is missing a name — fix {path}")
+        if not isinstance(p, dict):
+            sys.exit(f"people[{i}] is not a mapping — fix {path}")
+        # Trim all string values up front.
+        p = {k: (v.strip() if isinstance(v, str) else v) for k, v in p.items()}
+        if not (p.get("first_name") or p.get("name")):
+            sys.exit(f"people[{i}] is missing a first_name — fix {path}")
+        # A bare number parses as an int and would clobber the slug-based key
+        # everywhere (Dynamo, CLI queries). id must be a string slug or absent.
+        if "id" in p and not isinstance(p["id"], str):
+            sys.exit(f"people[{i}].id must be a quoted string slug (or omitted) — got {p['id']!r}")
         clean.append(p)
     return clean
 
 
+def full_name(entry):
+    """Display name from first/last (or the legacy single `name`)."""
+    parts = [entry.get("first_name"), entry.get("last_name")]
+    parts = [p.strip() for p in parts if p and str(p).strip()]
+    return " ".join(parts) or (entry.get("name") or "").strip()
+
+
 def resolve_slug(entry):
-    return entry.get("id") or slugify(entry["name"])
+    return (entry.get("id") or "").strip() or slugify(full_name(entry))
 
 
-def sync_file_to_live():
-    """Authoritative: make live Dynamo match people.yaml.
+def push_file_to_live(path):
+    """Authoritative: make live Dynamo match the people YAML at `path`.
     - people in the file but not live  -> created
     - people in live but not the file  -> removed (their lines detached)
-    - name/my_name/relationship/notes/follow_ups -> overwritten from the file
+    - first_name/last_name/my_name/relationship/notes/follow_ups -> overwritten
     - phone_numbers -> NumberIndex rebuilt to match the file exactly
     - calls/lastCalled -> preserved (owned by the webhook + summarizer, not the file)
     """
     ddb = dynamo()
-    file_entries = read_yaml(PEOPLE_YAML)
+    file_entries = read_yaml(path)
     file_slugs = {}
     for e in file_entries:
         file_slugs[resolve_slug(e)] = e
@@ -482,11 +436,17 @@ def sync_file_to_live():
         personal_notes = e.get("personal_notes") or ""
         if not personal_notes and (existing or {}).get("profile"):
             personal_notes = existing["profile"]["S"]
+        # name migration: new files use first_name/last_name; a legacy file
+        # with only `name` migrates into firstName.
+        first = e.get("first_name") or e.get("name") or ""
+        last = e.get("last_name") or ""
         write_person(
             slug,
-            name=e.get("name"),
+            firstName=first or None,
+            lastName=last or None,
             myName=e.get("my_name") or "Chris",
             relationship=e.get("relationship") or "",
+            attitude=e.get("attitude") or "",
             personalNotes=personal_notes,
             # llm_notes is summarizer-owned: omitted from the file -> keep the
             # live value, so a stale file can't wipe what the LLM wrote.
@@ -522,17 +482,17 @@ def sync_file_to_live():
         ddb.delete_item(TableName=T("People"), Key={"id": s(slug)})
         print(f"  removed person {slug} (not in file)")
 
-    print(f"live now matches {PEOPLE_YAML} ({len(file_slugs)} people)")
+    print(f"live now matches {path} ({len(file_slugs)} people)")
 
 
-def cmd_pull(_a):
-    people = live_people()
-    write_yaml(PEOPLE_YAML, people)
-    print(f"wrote {len(people)} people from live Dynamo to {PEOPLE_YAML}")
+def cmd_dump(_a):
+    """Write the live People + NumberIndex data as people.yaml to STDOUT.
+    Redirect it to save: `bin/vapi.py dump > people.yaml`."""
+    sys.stdout.write(render_yaml(live_people()))
 
 
-def cmd_sync(_a):
-    sync_file_to_live()
+def cmd_push(a):
+    push_file_to_live(a.path)
 
 
 def cmd_edit(_a):
@@ -566,7 +526,7 @@ def cmd_edit(_a):
         print("no changes made; nothing to commit")
         return
     print(f"committing {len(edited)} people back to live Dynamo...")
-    sync_file_to_live()
+    push_file_to_live(PEOPLE_YAML)
 
 
 # ------------------------------------------------------------------ calls
@@ -615,6 +575,170 @@ def cmd_call(a):
     sys.exit(f"no archive file matching {a.call_id}")
 
 
+# ------------------------------------------------------------------ logs
+
+# The lambda function name in CDK (src/vapi-call-handler.ts) is
+# `vapi-call-handler-<function>`; CloudWatch keeps logs at /aws/lambda/<name>.
+LOG_NAME = "vapi-call-handler"
+
+# Lambda log lines are "<ISO ts>\t<requestId>\t<LEVEL>\t<message>", where
+# message may span lines (console.info with an object). Lambda's own bookkeeping
+# (START/END/REPORT/INIT) gets filtered out, not parsed.
+_LEVEL_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z\t[\w-]+\t(INFO|WARN|ERROR|DEBUG)\t?")
+_LAMBDA_NOISE = ("START RequestId", "END RequestId", "REPORT RequestId", "INIT_START", "INIT_END")
+
+
+def _fmt_line(ev):
+    m = _LEVEL_RE.match(ev["message"])
+    level = m.group(1) if m else ""
+    body = (ev["message"][m.end():] if m else ev["message"]).rstrip()
+    ts = datetime.datetime.fromtimestamp(ev["timestamp"] / 1000).strftime("%H:%M:%S")
+    return f"[{ts}] {level:<5} {body}"
+
+
+# CloudWatch flake (observed, 2026-10-21, us-west-2): a filter_log_events with
+# a wide start time (~3.5 days back against a log group that only has a few
+# days of data) DETERMINISTICALLY returns 0 events, while the same data is
+# returned when the window starts a few hours wider, and 3h sub-chunks cover
+# the data every time. Don't fight it: query in chunks and merge.
+_CHUNK_MS = 24 * 3600 * 1000
+
+
+def _fetch_chunk(logs, group, start_ms, end_ms):
+    """One chunk, paginated (Limit=100/page), with a few retries — a single
+    transient failure must not turn into "no log lines"."""
+    for attempt in range(3):
+        try:
+            out, token = [], None
+            while True:
+                kw = {"logGroupName": group, "startTime": start_ms, "endTime": end_ms, "limit": 100}
+                # camelCase: this botocore build is case-sensitive on parameter names.
+                if token:
+                    kw["nextToken"] = token
+                r = logs.filter_log_events(**kw)
+                out += r.get("events", [])
+                token = r.get("NextToken")
+                if not token:
+                    return out
+            return out
+        except logs.exceptions.InvalidParameterException:
+            raise  # our window math is wrong; don't retry that
+        except Exception:
+            if attempt == 2:
+                raise
+            time.sleep(2 * (attempt + 1))
+
+
+def _chunked_events(logs, group, start_ms, end_ms):
+    """All events in [start_ms, end_ms), oldest first. The range is split into
+    _CHUNK_MS windows because wide windows flake (see _CHUNK_MS note); results
+    are deduped in case chunks overlap a boundary."""
+    chunks = []
+    for s in range(start_ms, end_ms, _CHUNK_MS):
+        e = min(s + _CHUNK_MS, end_ms)
+        chunks.append(_fetch_chunk(logs, group, s, e))
+    events, seen = [], set()
+    for c in chunks:
+        for ev in sorted(c, key=lambda x: x["timestamp"]):
+            key = (ev["timestamp"], ev["message"])
+            if key in seen:
+                continue
+            seen.add(key)
+            events.append(ev)
+    return events
+
+
+def _poll_new(logs, group, seen, since_ms):
+    """Events strictly after `since_ms`, deduped against `seen` and printed.
+    Returns the newest timestamp seen (for the next poll)."""
+    last = since_ms
+    for e in _chunked_events(logs, group, since_ms + 1, int(time.time() * 1000)):
+        if e["message"].startswith(_LAMBDA_NOISE):
+            continue  # Lambda bookkeeping, same filter as the initial fetch
+        key = (e["timestamp"], e["message"])
+        if key in seen:
+            continue
+        seen.add(key)
+        last = max(last, e["timestamp"])
+        if len(seen) > 1000:  # bound memory; keep the recent half
+            seen = set(sorted(seen)[-500:])
+        print(_fmt_line(e))
+        sys.stdout.flush()
+    return last
+
+
+def _spinner_line(poll_s, since_last_line_s):
+    """The in-place tail status: spinner + how long since the last line."""
+    frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    frame = frames[int(time.time() * 5) % len(frames)]
+    return (f"\r{frame} tailing — {since_last_line_s:.0f}s since last line "
+            f"(poll {poll_s}s) — Ctrl-C to stop")
+
+
+def _clear_status():
+    # Erase the spinner line (including anything it overran) before printing
+    # real log lines, so they land on their own lines.
+    sys.stdout.write("\r\033[K")
+    sys.stdout.flush()
+
+
+def cmd_logs(a):
+    import boto3
+    logs = boto3.client("logs", region_name="us-west-2")
+    group = f"/aws/lambda/{LOG_NAME}-{a.function}"
+    start_ms = int((time.time() - a.minutes * 60) * 1000)
+    end_ms = int(time.time() * 1000)
+    try:
+        events = _chunked_events(logs, group, start_ms, end_ms)
+    except logs.exceptions.ResourceNotFoundException:
+        sys.exit(f"no log group for {group} yet — does the function exist, and has it run?")
+    events.reverse()  # newest first
+    events = [e for e in events if not e["message"].startswith(_LAMBDA_NOISE)]
+    events = events[: a.limit]
+    for e in events:
+        print(_fmt_line(e))
+    if len(events) == a.limit:
+        print(f"… showing {a.limit} newest; widen --minutes or raise --limit")
+    if not a.tail:
+        return
+
+    seen = {(e["timestamp"], e["message"]) for e in events}
+    if events:
+        last_ts = max(seen)[0]
+    else:
+        # Nothing in the window: poll forward from now, and measure idle time
+        # from now so the heartbeat doesn't claim we've been quiet for hours.
+        print(f"(no log lines in the last {a.minutes} min for {a.function})")
+        last_ts = int(time.time() * 1000)
+    # On a tty the status is a spinner line redrawn in place (\r, no newline).
+    # Piped/redirected output can't do that, so fall back to a periodic line.
+    tty = sys.stdout.isatty()
+    if not tty:
+        print(f"(tail: polling every {a.poll}s — Ctrl-C to stop)")
+        sys.stdout.flush()
+    try:
+        while True:
+            # Sleep in short slices so the spinner ticks between polls.
+            deadline = time.time() + a.poll
+            while time.time() < deadline:
+                if tty and not a.quiet:
+                    sys.stdout.write(_spinner_line(a.poll, time.time() - last_ts / 1000) + "\033[K")
+                    sys.stdout.flush()
+                time.sleep(0.2)
+            if tty:
+                _clear_status()
+            last_ts = _poll_new(logs, group, seen, last_ts)
+            if not tty and time.time() - last_ts / 1000 >= 30 and not a.quiet:
+                # Heartbeat so an idle poll visibly keeps running: "no log
+                # lines yet" must not read as "the command ended."
+                print(f"(idle {int(time.time() - last_ts / 1000)}s — still polling, Ctrl-C to stop)")
+                sys.stdout.flush()
+    except KeyboardInterrupt:
+        if tty:
+            _clear_status()
+        print("\nstopped")
+
+
 # ------------------------------------------------------------------ vapi
 
 def cmd_vapi_show(_a):
@@ -624,29 +748,47 @@ def cmd_vapi_show(_a):
 
 def cmd_vapi_sync(a):
     url = a.url or _outputs().get("url")
-    secret = a.secret or read_secrets().get("vapiWebhookSecret")
+    local = read_local()
+    credential_id = a.credential or local.get("vapiCredentialId")
     if not url:
         sys.exit("need --url (the Function URL — also read from the deployed stack's outputs after `npm run deploy`)")
-    if not secret:
-        sys.exit("need --secret or vapiWebhookSecret in secrets.json")
-    fallback = a.fallback_number or read_local().get("fallbackNumber")
-    if not fallback or not re.fullmatch(r"\+\d{8,15}", fallback):
-        sys.exit("need a real E.164 fallback: --fallback-number or fallbackNumber in local.json")
+    if not credential_id or credential_id == "00000000-0000-0000-0000-000000000000":
+        sys.exit(
+            "need a Vapi custom credential: --credential <id> or vapiCredentialId in local.json.\n"
+            "Create it in the dashboard (Settings > Integrations > Server Configuration >\n"
+            "Add Custom Credential, type Bearer Token, Header Name 'Authorization',\n"
+            "Include Bearer Prefix ON, Token = vapiWebhookSecret from secrets.json),\n"
+            "then paste its id into local.json."
+        )
+    fallback_sip = a.fallback_sip or local.get("fallbackSipUri")
+    fallback = a.fallback_number or local.get("fallbackNumber")
+    if fallback_sip:
+        # SIP fallback rings your own line (e.g. voip.ms) — no second Vapi
+        # number in the loop, no self-forward.
+        dest = {"type": "sip", "sipUri": fallback_sip, "message": ""}
+    elif fallback and re.fullmatch(r"\+\d{8,15}", fallback):
+        dest = {"type": "number", "number": fallback, "message": ""}
+    else:
+        sys.exit(
+            "need a fallback: --fallback-sip <sipUri> / fallbackSipUri in local.json "
+            "(preferred — a SIP URI to your own line), "
+            "or --fallback-number / fallbackNumber (an E.164 number; must NOT be the Vapi number itself)"
+        )
     body = {
         "server": {
             "url": url,
-            "headers": {"x-vapi-webhook-secret": secret},
+            "credentialId": credential_id,
             "timeoutSeconds": 7,  # reply must land inside 7.5s end-to-end
+            # Explicit empty map: a PATCH that omits `headers` does NOT clear
+            # them, so a stale inline secret would linger on the number.
+            "headers": {},
         },
-        "fallbackDestination": {
-            "type": "number",
-            "number": fallback,
-            "message": "",
-        },
+        "fallbackDestination": dest,
     }
-    n = vapi("PATCH", f"/phone-number/{read_local()['vapiMobileNumberId']}", body)
+    n = vapi("PATCH", f"/phone-number/{local['vapiMobileNumberId']}", body)
     print(json.dumps({k: n.get(k) for k in ("name", "number", "server", "fallbackDestination")}, indent=2))
     print("\nMobile number now routes inbound calls through the webhook.")
+    print("Vapi authenticates each webhook with Authorization: Bearer <credential token>.")
     print("Test: call it from a known and an unknown number, then `bin/vapi.py calls`.")
 
 
@@ -658,48 +800,15 @@ def main():
 
     sub.add_parser("people").set_defaults(fn=cmd_people)
 
-    a = sub.add_parser("add", help="create a person")
-    a.add_argument("name", help="display name (slug is derived)")
-    a.add_argument("--my-name", help='"Chris" or "David"')
-    a.add_argument("--relationship")
-    a.add_argument("--notes", help="personal notes (hand-edited; the LLM never writes these)")
-    a.add_argument("--number", action="append", help="line they call from (repeatable)")
-    a.set_defaults(fn=cmd_add)
-
-    an = sub.add_parser("add-number", help="attach another line to an existing person")
-    an.add_argument("slug")
-    an.add_argument("number")
-    an.set_defaults(fn=cmd_add_number)
-
-    u = sub.add_parser("update")
-    u.add_argument("slug")
-    u.add_argument("--name")
-    u.add_argument("--my-name")
-    u.add_argument("--relationship")
-    u.add_argument("--notes", help="personal notes (hand-edited; the LLM never writes these)")
-    u.add_argument("--llm-notes", help="the LLM-maintained notes")
-    u.add_argument("--follow-ups")
-    u.set_defaults(fn=cmd_update)
-
     r = sub.add_parser("rm")
     r.add_argument("slug")
     r.set_defaults(fn=cmd_rm)
 
-    sh = sub.add_parser("line", help="who uses a given phone line (show/add/rm)")
-    shsub = sh.add_subparsers(dest="lcmd", required=True)
-    shs = shsub.add_parser("show", help="list the people on a line")
-    shs.add_argument("number")
-    sha = shsub.add_parser("add", help="add people to a line (making it shared if >1)")
-    sha.add_argument("number")
-    sha.add_argument("people", nargs="+")
-    shr = shsub.add_parser("rm", help="remove people from a line")
-    shr.add_argument("number")
-    shr.add_argument("people", nargs="+")
-    sh.set_defaults(fn=cmd_line)
-
-    sub.add_parser("pull", help="write live Dynamo into people.yaml").set_defaults(fn=cmd_pull)
-    sub.add_parser("sync", help="push people.yaml into live Dynamo (authoritative)").set_defaults(fn=cmd_sync)
-    sub.add_parser("edit", help="pull, open $EDITOR, and commit edits back").set_defaults(fn=cmd_edit)
+    sub.add_parser("dump", help="write live Dynamo as people.yaml to stdout (save: `dump > people.yaml`)").set_defaults(fn=cmd_dump)
+    pp = sub.add_parser("push", help="push a people YAML file into live Dynamo (authoritative)")
+    pp.add_argument("path", help="path to the people YAML file to push (e.g. people.yaml)")
+    pp.set_defaults(fn=cmd_push)
+    sub.add_parser("edit", help="dump live, open $EDITOR, and push edits back").set_defaults(fn=cmd_edit)
 
     c = sub.add_parser("calls")
     c.add_argument("--person", help="slug: everything discussed with this person")
@@ -711,13 +820,23 @@ def main():
     cl.add_argument("call_id")
     cl.set_defaults(fn=cmd_call)
 
+    lg = sub.add_parser("logs", help="webhook CloudWatch logs (newest first)")
+    lg.add_argument("--function", choices=["webhook", "after-call"], default="webhook")
+    lg.add_argument("--minutes", type=int, default=30, help="look back N minutes (default 30)")
+    lg.add_argument("--limit", type=int, default=50, help="max lines to show (default 50)")
+    lg.add_argument("--tail", action="store_true", help="keep printing new lines as they arrive")
+    lg.add_argument("--poll", type=int, default=5, help="tail poll interval seconds (default 5)")
+    lg.add_argument("--quiet", action="store_true", help="no spinner/heartbeat while tailing — log lines only")
+    lg.set_defaults(fn=cmd_logs)
+
     v = sub.add_parser("vapi")
     vsub = v.add_subparsers(dest="vcmd", required=True)
     vsub.add_parser("show").set_defaults(fn=cmd_vapi_show)
     s_ = vsub.add_parser("sync")
     s_.add_argument("--url")
-    s_.add_argument("--secret")
-    s_.add_argument("--fallback-number", help="defaults to fallbackNumber in local.json")
+    s_.add_argument("--credential", help="custom credential id (defaults to vapiCredentialId in local.json)")
+    s_.add_argument("--fallback-sip", help="SIP fallback URI (preferred; defaults to fallbackSipUri in local.json)")
+    s_.add_argument("--fallback-number", help="E.164 fallback number (defaults to fallbackNumber in local.json)")
     s_.set_defaults(fn=cmd_vapi_sync)
 
     args = p.parse_args()

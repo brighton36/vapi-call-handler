@@ -1,17 +1,22 @@
 # people.yaml — the seed and source of truth for the call-handler database.
 #
 # This file is how you manage the database:
-#   bin/vapi.py sync     # push this file -> live Dynamo
-#   bin/vapi.py edit     # pull live Dynamo into this file, open $EDITOR,
+#   bin/vapi.py dump     # write current live data to stdout (`dump > people.yaml`)
+#   bin/vapi.py push <file>  # push that YAML file -> live Dynamo
+#   bin/vapi.py edit     # dump live Dynamo into this file, open $EDITOR,
 #                        # save to commit back (or quit without saving to cancel)
 # The webhook also ships a copy of this file and falls back to it if Dynamo
 # is unreachable, so keep it in the repo.
 #
 # Fields per person:
-#   id:            optional slug; derived from name when omitted
-#   name:          display name (required)
+#   id:            optional slug; derived from the full name when omitted
+#   first_name:    first name (required)
+#   last_name:     last name (optional)
 #   my_name:       which name to use when this person calls: Chris or David
 #   relationship:  free-form ("mom", "neighbor", "rabbi's wife")
+#   attitude:      the tone the assistant takes with this person. Free-form
+#                  ("professional" by default, or "warm", "chatty", ...)
+#                  — omit for the default.
 #   phone_numbers: every line this person calls from. If TWO people list the
 #                  same line, it becomes a shared line — the assistant greets
 #                  generically and asks who's speaking
@@ -24,13 +29,15 @@
 # This repo is PUBLIC — do not commit real names, numbers, or other PII.
 # The entries below are fictional examples using 555-01XX numbers (reserved
 # for fiction); replace them with your real data, which then lives only on
-# your machine and in live Dynamo (`bin/vapi.py pull` refreshes this file
-# from the live data).
+# your machine and in live Dynamo (`bin/vapi.py dump > people.yaml`
+# refreshes this file from the live data).
 people:
   - id: maria
-    name: Maria
+    first_name: Maria
+    last_name: Sample
     my_name: David
     relationship: mom
+    attitude: warm   # tone the assistant takes with this person (default: professional)
     phone_numbers:
       - "+15550123400"   # her cell
       - "+15550123401"   # second line, e.g. her office
@@ -39,7 +46,8 @@ people:
     follow_ups: "Ask how the garden is doing."
 
   - id: sam
-    name: Sam
+    first_name: Sam
+    last_name: Sample
     my_name: Chris
     relationship: neighbor
     phone_numbers:
@@ -48,14 +56,16 @@ people:
   # A shared line: both Ruth and Noah list this number, so calls from it
   # get a generic greeting and the assistant asks who's speaking.
   - id: ruth
-    name: Ruth
+    first_name: Ruth
+    last_name: Sample
     my_name: Chris
     relationship: rabbi's wife
     phone_numbers:
       - "+15550123403"
 
   - id: noah
-    name: Noah
+    first_name: Noah
+    last_name: Sample
     my_name: Chris
     relationship: ruth's son
     phone_numbers:

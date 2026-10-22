@@ -78,6 +78,7 @@ export class VapiCallHandlerStack extends cdk.Stack {
     const local = readJson('local.json')
     const secrets = readJson('secrets.json')
     if (!secrets.vapiWebhookSecret) throw new Error('secrets.json needs vapiWebhookSecret')
+    if (!local.vapiRecognizedAssistantId) throw new Error('local.json needs vapiRecognizedAssistantId (Mobile Call Recognized assistant)')
 
     const webhook = new lambda.Function(this, 'Webhook', {
       functionName: `${NAME}-webhook`,
@@ -88,7 +89,8 @@ export class VapiCallHandlerStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(10),
       description: 'Vapi webhook: caller resolution (assistant-request) + call archive/index',
       environment: {
-        ASSISTANT_ID: local.vapiAssistantId, // Mobile Call Screener
+        ASSISTANT_ID: local.vapiAssistantId, // Mobile Call Screener — unknown callers
+        RECOGNIZED_ASSISTANT_ID: local.vapiRecognizedAssistantId, // Mobile Call Recognized — known personal lines
         VAPI_WEBHOOK_SECRET: secrets.vapiWebhookSecret,
         VAPI_PEOPLE_TABLE: people.tableName,
         VAPI_NUMBER_INDEX_TABLE: numberIndex.tableName,
@@ -105,6 +107,22 @@ export class VapiCallHandlerStack extends cdk.Stack {
     // x-vapi-webhook-secret shared secret (Vapi can't do signed webhooks
     // beyond this; see bin/vapi.py vapi sync).
     const fnUrl = webhook.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.NONE })
+
+    // Since Oct 2025 an AuthType NONE Function URL requires TWO grants in the
+    // function's resource-based policy: lambda:InvokeFunctionUrl (added by
+    // addFunctionUrl above) AND lambda:InvokeFunction. CDK (this build) only
+    // writes the first, so every request 403s without the second. CDK's
+    // CfnPermission can't express InvokedViaFunctionUrl, hence the raw
+    // CfnResource.
+    new cdk.CfnResource(this, 'WebhookInvokeFunctionUrl', {
+      type: 'AWS::Lambda::Permission',
+      properties: {
+        Action: 'lambda:InvokeFunction',
+        FunctionName: webhook.functionName,
+        Principal: '*',
+        InvokedViaFunctionUrl: true,
+      },
+    })
 
     // --------------------------------------------- deferred after-call job
     // One invocation per batch of NEW call rows (INSERT only — the webhook's

@@ -14,3 +14,4 @@ secrets.json
 people.yaml
 people.yaml.bak
 .DS_Store
+cdk.context.json

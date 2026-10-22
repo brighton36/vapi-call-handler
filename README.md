@@ -28,7 +28,7 @@ DynamoDB tables:
 
 | Table | Key | Meaning |
 |---|---|---|
-| `People` | `id` (slug, e.g. `maria`) | the profile: name, myName, relationship, personalNotes, llmNotes, followUps, calls, lastCalled |
+| `People` | `id` (slug, e.g. `maria`) | the profile: firstName, lastName, myName, relationship, personalNotes, llmNotes, followUps, calls, lastCalled |
 | `NumberIndex` | `number` (E.164) | incoming number → `people[]` (the people who use that line) |
 | `CallIndex` | `callId`, GSI `ByPerson(personId, startedAt)` | one row per call — a person **has many** calls via this GSI. Each row: `startedAt`, `endedAt`, `durationSeconds`, `number`, `cost`, `endedReason`, `llmNotes` (phase 3). `bin/vapi.py calls --person maria` lists them newest first |
 
@@ -76,8 +76,8 @@ end-to-end):
 - `people.yaml` (gitignored) — **the source of truth for the database**, an array of
   people (see "Managing the database"). Bundled into the Lambda as the
   webhook's fallback when Dynamo is unreachable.
-- `bin/vapi.py` — local CLI (no GUI): people CRUD, line management,
-  YAML sync/edit, call queries, Vapi phone-number config.
+- `bin/vapi.py` — local CLI (no GUI): people listing/removal, YAML
+  dump/push/edit, call queries, Vapi phone-number config.
 - `People` + `NumberIndex` + `CallIndex` (Dynamo), `CallLogs` (S3).
 
 ## Managing the database (YAML)
@@ -87,10 +87,12 @@ is the committed, fictional sample. Each entry is a person:
 
 ```yaml
 people:
-  - id: maria            # optional; derived from the name when omitted
-    name: Maria
-    my_name: David     # which name to use when they call
+  - id: maria            # optional; derived from the full name when omitted
+    first_name: Maria
+    last_name: Sample
+    my_name: John     # which name to use when they call
     relationship: mom
+    attitude: warm     # tone the assistant takes (default: professional)
     phone_numbers:     # every line they call from
       - "+15550123400"
       - "+15550123401"
@@ -109,20 +111,21 @@ If two people list the same number it becomes a **shared line**.
 Three commands move it to and from live Dynamo:
 
 ```sh
-bin/vapi.py pull     # live Dynamo  ->  people.yaml   (read current state)
-bin/vapi.py sync     # people.yaml  ->  live Dynamo   (authoritative: the
+bin/vapi.py dump     # live Dynamo  ->  people.yaml on stdout
+                     #                (save it: `bin/vapi.py dump > people.yaml`)
+bin/vapi.py push <file>   # <file>  ->  live Dynamo   (authoritative: the
                      #                file wins; people removed from the file
                      #                are deleted, lines rebuilt to match)
-bin/vapi.py edit     # pull, open $EDITOR, and commit your edits back
+bin/vapi.py edit     # dump live, open $EDITOR, and push your edits back
 ```
 
 `edit` backs the file up first, loads the live data, opens it in `$EDITOR`
 (or `$VISUAL`), and on save reconciles back to Dynamo. Quit without saving
 (or if the YAML is invalid) and it restores the backup and changes nothing.
 `calls`/`lastCalled` are owned by the webhook and the phase-3 summarizer, so
-`sync` preserves them and the file doesn't carry them.
+`push` preserves them and the file doesn't carry them.
 
-`people.yaml` is gitignored, so `pull`/`edit` can't leak real data into
+`people.yaml` is gitignored, so `dump`/`edit` can't leak real data into
 the public repo. The webhook bundles it as its Dynamo-down fallback (or the
 sample, on a checkout without one).
 
@@ -132,12 +135,12 @@ sample, on a checkout without one).
 npm install
 npm install-scripts approve esbuild   # if npm blocked esbuild's postinstall
 pip install boto3 requests pyyaml
-cp local.json.example local.json       # Vapi number/assistant IDs + fallbackNumber (your cell)
+cp local.json.example local.json       # Vapi number/assistant IDs + credential id + fallbackSipUri
 cp secrets.json.example secrets.json   # vapiToken + vapiWebhookSecret (openssl rand -hex 24)
 cp people.example.yaml people.yaml     # then replace the sample with your real people
 npm run build                          # cdk synth — writes cdk.out/outputs.json
 npm run deploy                         # cdk deploy (us-west-2, pinned in the app)
-bin/vapi.py sync                 # seed live Dynamo from people.yaml
+bin/vapi.py push people.yaml     # seed live Dynamo from people.yaml
 bin/vapi.py vapi sync            # point the number at the webhook (url read from outputs.json)
 ```
 
@@ -147,20 +150,26 @@ the Lambda's environment at deploy) and `bin/vapi.py` (Vapi API token,
 and the same webhook secret for `vapi sync`) — no env vars, no cdk
 secrets.
 
-`local.json` (gitignored) holds the two Vapi identifiers — your personal
-phone number's ID and the Mobile Call Screener assistant ID — from the Vapi
-dashboard (Numbers / Assistants pages), plus `fallbackNumber`, where calls
-are forwarded if the webhook fails. The CDK stack reads the assistant
-ID from it at deploy time; `bin/vapi.py` reads the rest for the
-`vapi show` / `vapi sync` commands.
+`local.json` (gitignored) holds the Vapi identifiers — your personal
+phone number's ID, the Mobile Call Screener assistant ID, the custom
+credential's ID (from Dashboard → Settings → Integrations → Server
+Configuration), and `fallbackSipUri` (your own SIP line — calls forward
+there if the webhook fails). The CDK stack reads the assistant ID from it
+at deploy time; `bin/vapi.py` reads the rest for the `vapi show` /
+`vapi sync` commands.
 
 `vapi sync` sets, on the Mobile number only:
 
-- `server.url` + `server.headers["x-vapi-webhook-secret"]` (the only sender
-  Vapi trusts; the webhook returns 401 without it)
-- `fallbackDestination` → your mobile number, so a failed webhook forwards
-  the call instead of dropping it
-- `assistantId` stays set as a safety net
+- `server.url` + `server.credentialId` (a Vapi custom credential — Bearer
+  Token, `Authorization: Bearer <vapiWebhookSecret>`; the only sender Vapi
+  trusts, and the webhook returns 401 without it). The legacy inline
+  `server.headers["x-vapi-webhook-secret"]` header is still accepted by the
+  webhook during the migration window and can be removed later.
+- `fallbackDestination` → your SIP line (`fallbackSipUri`), so a failed
+  webhook forwards the call to your real phone instead of dropping it
+  (and instead of the old self-forward loop). Note: the number has NO
+  static `assistantId` — the webhook is the router, so a dead webhook
+  goes straight to the SIP fallback, not to a default assistant
 
 ## Assistant prompt variables
 
@@ -171,6 +180,9 @@ Mobile Call Screener assistant needs a prompt that references them
 - `{{callerName}}` — blank for unknown callers **and shared lines**
 - `{{myName}}` — who to represent
 - `{{callerRelationship}}` — "mom", "neighbor", ...
+- `{{callerAttitude}}` — the tone to take with this caller (the person's
+  `attitude`, defaulting to "professional"; set on every path, unknown/shared
+  included)
 - `{{callerNotes}}` — phase 3; empty for now
 - `{{callerSharedWith}}` — "Ruth, Noah" for a shared line (everyone who
   uses it); the prompt should say "ask who's speaking" when this is set
@@ -186,31 +198,32 @@ Mobile Call Screener assistant needs a prompt that references them
   stranger (wording lives in the prompt).
 - Shared line → `callerSharedWith` names the candidates; the assistant
   asks rather than assumes.
-- Webhook down or slow → Vapi uses the number's `assistantId` (current
-  static assistant), or if even that fails the `fallbackDestination`
-  forwards the call to my phone.
+- Webhook down or slow → no static assistant to fall back to (it's
+  unset — the webhook is the router), so the `fallbackDestination`
+  forwards the call straight to my SIP line (real phone).
 - Every call, whether handled or not, lands in S3 + CallIndex (the
   end-of-call-report path re-resolves the person, so the index is
   person-keyed even for calls that took the fallback path).
 
 ## Ops
 
-Manage people via the YAML file (the primary way) or ad-hoc commands:
+Manage people via the YAML file (the primary way) or ad-hoc:
 
 ```sh
-bin/vapi.py edit                       # pull -> $EDITOR -> commit back
-bin/vapi.py pull                       # live Dynamo -> people.yaml
-bin/vapi.py sync                       # people.yaml -> live Dynamo
+bin/vapi.py dump                       # live Dynamo -> people.yaml on stdout
+bin/vapi.py push                       # people.yaml -> live Dynamo (authoritative)
+bin/vapi.py edit                       # dump -> $EDITOR -> push back
 bin/vapi.py people                     # list everyone + their lines
-bin/vapi.py line show +15550123403     # who uses this line
-# ad-hoc (writes Dynamo directly; a later `pull`/`edit` picks it up):
-bin/vapi.py add Sophie --my-name John --relationship aunt --number +1555...
-bin/vapi.py line add  +15550123403 ruth noah   # make a line shared
-bin/vapi.py calls --days 7            # recent calls
-bin/vapi.py calls --person maria        # everything we've discussed with maria
-bin/vapi.py call <callId>             # full archive (transcript + messages)
-cat cdk.out/outputs.json           # Function URL, table/bucket names (written by synth)
+bin/vapi.py rm <slug>                  # delete a person (their lines drop too)
+bin/vapi.py calls --days 7             # recent calls
+bin/vapi.py calls --person maria       # everything we've discussed with maria
+bin/vapi.py call <callId>              # full archive (transcript + messages)
+bin/vapi.py vapi show                  # current phone number config
+bin/vapi.py vapi sync                  # point the number at the webhook
 ```
+
+To view the deployed Function URL / table / bucket names:
+`aws cloudformation describe-stacks --stack-name VapiCallHandlerStack --query 'Stacks[0].Outputs'`.
 
 Tests: `npx vitest run` (no AWS needed — pure resolution logic only).
 

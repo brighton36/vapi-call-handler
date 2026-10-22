@@ -66,20 +66,42 @@ function safeEqual(a: string, b: string): boolean {
 }
 
 // The Vapi Server URL is public — anyone with the domain can POST here.
-// bin/sync puts a shared secret on the phone number's server.headers, so the
-// only legitimate sender is Vapi. Everything else gets 401 before any logic.
+// bin/vapi.py `vapi sync` references a Vapi custom credential (Bearer) on the
+// phone number, so the only legitimate sender is Vapi. Everything else gets
+// 401 before any logic.
+//
+// Accepted header formats (both carry the same secret):
+//   Authorization: Bearer ***            <- current (custom credential)
+//   x-vapi-webhook-secret: <secret>      <- legacy inline header, accepted
+//                                           during the migration window
 export function authGuard(handler: (event: any) => Promise<any>) {
   return async (event: any) => {
     const expected = process.env.VAPI_WEBHOOK_SECRET
-    const provided: string | undefined = event?.headers?.['x-vapi-webhook-secret']
     if (!expected) {
       console.error('VAPI_WEBHOOK_SECRET is not set; rejecting webhook')
       return { statusCode: 500, body: JSON.stringify({ error: 'webhook secret not configured' }) }
     }
+    const provided = extractSecret(event?.headers)
     if (!provided || !safeEqual(provided, expected)) {
       console.warn('webhook rejected: missing or bad secret')
       return { statusCode: 401, body: JSON.stringify({ error: 'unauthorized' }) }
     }
     return handler(event)
   }
+}
+
+// Pull the secret out of the event headers, whichever header Vapi's
+// credential is configured to send. Case-insensitive header lookup (HTTP
+// headers are case-insensitive; Function URL events lower-case them).
+function extractSecret(headers: Record<string, unknown> | undefined): string | undefined {
+  if (!headers) return undefined
+  const h: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(headers)) h[k.toLowerCase()] = v
+  const auth = h['authorization']
+  if (typeof auth === 'string' && auth.startsWith('Bearer ')) {
+    const token = auth.slice('Bearer '.length).trim()
+    if (token) return token
+  }
+  const legacy = h['x-vapi-webhook-secret']
+  return typeof legacy === 'string' && legacy ? legacy : undefined
 }

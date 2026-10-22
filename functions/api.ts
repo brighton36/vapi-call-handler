@@ -7,7 +7,7 @@ import {
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
 import { authGuard, timingMiddleware, extractCallerNumber, callDurationSeconds, parseWebhookBody } from '../lib/vapi'
 import { computeFrequency, describeFrequency } from '../lib/frequency'
-import { loadPeopleFile, resolveFromPeopleFile, fromPersonDynamo } from '../lib/people'
+import { loadPeopleFile, resolveFromPeopleFile, fromPersonDynamo, fullName } from '../lib/people'
 import type { Resolution } from '../lib/people'
 import type {
   AssistantRequestPayload,
@@ -86,6 +86,8 @@ interface PromptContext {
   callerName: string
   myName: string
   callerRelationship: string
+  // Tone to take with this caller; 'professional' when the person has none set.
+  callerAttitude: string
   callerNotes: string
   callerSharedWith: string
   // How often they've called lately, e.g. "2 calls in the last 24 hours, 3 in
@@ -118,14 +120,15 @@ function frequencyContext(recentCalls: string[] | undefined, now = new Date()) {
 //                      the prompt is told to ask, not assume.
 async function toPromptContext(res: Resolution): Promise<PromptContext> {
   if (res.personIds.length === 0) {
-    return { callerName: '', myName: 'Chris', callerRelationship: '', callerNotes: '', callerSharedWith: '', ...NO_FREQUENCY }
+    return { callerName: '', myName: 'Chris', callerRelationship: '', callerAttitude: 'professional', callerNotes: '', callerSharedWith: '', ...NO_FREQUENCY }
   }
   if (res.personIds.length === 1 && res.person) {
     const p = res.person
     return {
-      callerName: p.name ?? '',
+      callerName: fullName(p) || res.personIds[0],
       myName: p.myName ?? 'Chris',
       callerRelationship: p.relationship ?? '',
+      callerAttitude: p.attitude ?? 'professional',
       callerNotes: [p.personalNotes, p.llmNotes, p.followUps].filter(Boolean).join(' '),
       callerSharedWith: '',
       ...frequencyContext('recentCalls' in p ? p.recentCalls : undefined),
@@ -138,6 +141,7 @@ async function toPromptContext(res: Resolution): Promise<PromptContext> {
     callerName: '',
     myName: 'Chris',
     callerRelationship: '',
+    callerAttitude: 'professional',
     callerNotes: '',
     callerSharedWith: res.personIds.map((id) => names[id]).join(', '),
     ...NO_FREQUENCY,
@@ -151,7 +155,7 @@ async function namesFor(ids: string[]): Promise<Record<string, string>> {
   const out: Record<string, string> = {}
   const missing: string[] = []
   for (const id of ids) {
-    const n = file[id]?.name
+    const n = file[id] ? fullName(file[id]) : ''
     if (n) out[id] = n
     else missing.push(id)
   }
@@ -168,7 +172,7 @@ async function namesFor(ids: string[]): Promise<Record<string, string>> {
       )
       for (const it of (res.Responses?.[PEOPLE_TABLE] ?? [])) {
         const id = (it as any).id?.S
-        const name = (it as any).name?.S
+        const name = [it.firstName?.S, it.lastName?.S].filter(Boolean).join(' ') || it.name?.S
         if (id && name) out[id] = name
       }
     } catch (err) {
@@ -279,11 +283,18 @@ export const handler = authGuard(
         shared: res.personIds.length > 1,
         ms: Date.now() - started,
       })
+      // Known personal line -> the recognized-caller assistant, which consumes
+      // the caller slots ({{callerName}}, notes, ...). Everyone else (unknown
+      // number, shared line) -> the screener. (Shared-line routing is an open
+      // decision — see TODO #2.)
+      const recognized = res.personIds.length === 1 && res.person
+      const assistantId = recognized ? process.env.RECOGNIZED_ASSISTANT_ID : process.env.ASSISTANT_ID
+      console.info('assistant-request routing', { recognized, assistantId })
       return {
         statusCode: 200,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          assistantId: process.env.ASSISTANT_ID,
+          assistantId,
           assistantOverrides: {
             variableValues: ctx,
           },

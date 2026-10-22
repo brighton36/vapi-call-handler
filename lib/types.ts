@@ -68,10 +68,17 @@ export interface EndOfCallReportPayload {
 export interface Person {
   // slug, e.g. "maria"
   id: string
+  firstName?: string
+  lastName?: string
+  // Legacy rows (pre-rename) carried a single `name` attribute; read paths
+  // fall back to it.
   name?: string
   // Which name to call Chris when this person calls: "Chris" or "David".
   myName?: string
   relationship?: string
+  // The tone the assistant takes with this person ("professional", "warm",
+  // "chatty", ...). Free-form; defaults to "professional" when unset.
+  attitude?: string
   // Hand-edited by you in people.yaml. The LLM / phase-3 summarizer must
   // NEVER write this.
   personalNotes?: string
@@ -142,9 +149,13 @@ export interface CallLog {
 // ---------------------------------------------------------------- contacts.json
 // The in-repo seed / fallback, keyed by person slug.
 export interface PersonFileEntry {
-  name: string
+  firstName: string
+  lastName?: string
+  // Legacy (pre-rename) file entries carried a single `name`.
+  name?: string
   myName: string
   relationship?: string
+  attitude?: string
   // Every line this person calls from.
   numbers: string[]
   // From people.yaml personal_notes / llm_notes.
