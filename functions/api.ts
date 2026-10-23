@@ -84,6 +84,10 @@ async function fetchPeople(ids: string[]): Promise<Record<string, Person | undef
 
 interface PromptContext {
   callerName: string
+  // First/last split of the caller's name — '' when the line is unknown or
+  // shared (the prompt asks who's speaking instead).
+  callerFirstName: string
+  callerLastName: string
   myName: string
   callerRelationship: string
   // Tone to take with this caller; 'professional' when the person has none set.
@@ -120,12 +124,14 @@ function frequencyContext(recentCalls: string[] | undefined, now = new Date()) {
 //                      the prompt is told to ask, not assume.
 async function toPromptContext(res: Resolution): Promise<PromptContext> {
   if (res.personIds.length === 0) {
-    return { callerName: '', myName: 'Chris', callerRelationship: '', callerAttitude: 'professional', callerNotes: '', callerSharedWith: '', ...NO_FREQUENCY }
+    return { callerName: '', callerFirstName: '', callerLastName: '', myName: 'Chris', callerRelationship: '', callerAttitude: 'professional', callerNotes: '', callerSharedWith: '', ...NO_FREQUENCY }
   }
   if (res.personIds.length === 1 && res.person) {
     const p = res.person
     return {
       callerName: fullName(p) || res.personIds[0],
+      callerFirstName: p.firstName ?? '',
+      callerLastName: p.lastName ?? '',
       myName: p.myName ?? 'Chris',
       callerRelationship: p.relationship ?? '',
       callerAttitude: p.attitude ?? 'professional',
@@ -139,6 +145,8 @@ async function toPromptContext(res: Resolution): Promise<PromptContext> {
   const names = await namesFor(res.personIds)
   return {
     callerName: '',
+    callerFirstName: '',
+    callerLastName: '',
     myName: 'Chris',
     callerRelationship: '',
     callerAttitude: 'professional',

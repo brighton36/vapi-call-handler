@@ -70,10 +70,8 @@ function safeEqual(a: string, b: string): boolean {
 // phone number, so the only legitimate sender is Vapi. Everything else gets
 // 401 before any logic.
 //
-// Accepted header formats (both carry the same secret):
-//   Authorization: Bearer ***            <- current (custom credential)
-//   x-vapi-webhook-secret: <secret>      <- legacy inline header, accepted
-//                                           during the migration window
+// Accepted header format (carries the credential secret):
+//   Authorization: Bearer ***
 export function authGuard(handler: (event: any) => Promise<any>) {
   return async (event: any) => {
     const expected = process.env.VAPI_WEBHOOK_SECRET
@@ -90,9 +88,9 @@ export function authGuard(handler: (event: any) => Promise<any>) {
   }
 }
 
-// Pull the secret out of the event headers, whichever header Vapi's
-// credential is configured to send. Case-insensitive header lookup (HTTP
-// headers are case-insensitive; Function URL events lower-case them).
+// Pull the secret out of the Authorization header. Case-insensitive header
+// lookup (HTTP headers are case-insensitive; Function URL events lower-case
+// them).
 function extractSecret(headers: Record<string, unknown> | undefined): string | undefined {
   if (!headers) return undefined
   const h: Record<string, unknown> = {}
@@ -102,6 +100,5 @@ function extractSecret(headers: Record<string, unknown> | undefined): string | u
     const token = auth.slice('Bearer '.length).trim()
     if (token) return token
   }
-  const legacy = h['x-vapi-webhook-secret']
-  return typeof legacy === 'string' && legacy ? legacy : undefined
+  return undefined
 }

@@ -162,9 +162,7 @@ at deploy time; `bin/vapi.py` reads the rest for the `vapi show` /
 
 - `server.url` + `server.credentialId` (a Vapi custom credential — Bearer
   Token, `Authorization: Bearer <vapiWebhookSecret>`; the only sender Vapi
-  trusts, and the webhook returns 401 without it). The legacy inline
-  `server.headers["x-vapi-webhook-secret"]` header is still accepted by the
-  webhook during the migration window and can be removed later.
+  trusts, and the webhook returns 401 without it).
 - `fallbackDestination` → your SIP line (`fallbackSipUri`), so a failed
   webhook forwards the call to your real phone instead of dropping it
   (and instead of the old self-forward loop). Note: the number has NO

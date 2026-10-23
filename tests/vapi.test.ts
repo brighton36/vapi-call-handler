@@ -221,17 +221,11 @@ describe('authGuard', () => {
     process.env.VAPI_WEBHOOK_SECRET = orig
   })
 
-  it('accepts Authorization: Bearer *** (custom credential format)', async () => {
+  it('accepts Authorization: Bearer <token> (custom credential format)', async () => {
     process.env.VAPI_WEBHOOK_SECRET = SECRET
     const r = await handler({ headers: { authorization: `Bearer ${SECRET}` }, body: '{}' } as any)
     expect(r.statusCode).toBe(200)
     expect(JSON.parse(r.body)).toEqual({ ok: true })
-  })
-
-  it('accepts the legacy x-vapi-webhook-secret header (migration window)', async () => {
-    process.env.VAPI_WEBHOOK_SECRET = SECRET
-    const r = await handler({ headers: { 'x-vapi-webhook-secret': SECRET }, body: '{}' } as any)
-    expect(r.statusCode).toBe(200)
   })
 
   it('is case-insensitive on header names', async () => {
@@ -252,22 +246,6 @@ describe('authGuard', () => {
     expect((await handler({ headers: { authorization: 'Bearer ' }, body: '{}' } as any)).statusCode).toBe(401)
     expect((await handler({ headers: {}, body: '{}' } as any)).statusCode).toBe(401)
     expect((await handler({} as any)).statusCode).toBe(401)
-  })
-
-  it('rejects when headers and the secret disagree (no mixing)', async () => {
-    process.env.VAPI_WEBHOOK_SECRET = SECRET
-    // legacy header has the right secret, but the Authorization header wins
-    // when present — a wrong bearer must not be papered over by a legacy hit.
-    const r = await handler({
-      headers: { authorization: `Bearer ${SECRET}`, 'x-vapi-webhook-secret': 'stale' },
-      body: '{}',
-    } as any)
-    expect(r.statusCode).toBe(200)
-    const r2 = await handler({
-      headers: { authorization: 'Bearer wrong', 'x-vapi-webhook-secret': SECRET },
-      body: '{}',
-    } as any)
-    expect(r2.statusCode).toBe(401)
   })
 
   it('fails closed (500) when VAPI_WEBHOOK_SECRET is not configured', async () => {

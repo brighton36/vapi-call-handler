@@ -103,9 +103,9 @@ export class VapiCallHandlerStack extends cdk.Stack {
     callIndex.grantReadWriteData(webhook)
     callLogs.grantPut(webhook)
 
-    // Public HTTPS endpoint. Auth is done inside the handler via the
-    // x-vapi-webhook-secret shared secret (Vapi can't do signed webhooks
-    // beyond this; see bin/vapi.py vapi sync).
+    // Public HTTPS endpoint. Auth is done inside the handler via a Bearer
+    // credential (Vapi custom credential, `Authorization: Bearer ***
+    // — Vapi can't do signed webhooks beyond this; see bin/vapi.py vapi sync).
     const fnUrl = webhook.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.NONE })
 
     // Since Oct 2025 an AuthType NONE Function URL requires TWO grants in the

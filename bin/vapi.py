@@ -25,6 +25,7 @@ Usage:
   bin/vapi.py edit                      # dump live, open $EDITOR, push edits back
   bin/vapi.py calls --days 7            # recent calls (overall)
   bin/vapi.py calls --person maria      # everything we've discussed with maria
+  bin/vapi.py calls --transcript        # indent each call's transcript under its entry
   bin/vapi.py call <callId>             # full archive file for one call
   bin/vapi.py vapi show                 # current phone number config
   bin/vapi.py vapi sync --url <webhook> # point number at the deployed webhook
@@ -553,16 +554,35 @@ def cmd_calls(a):
         rows.sort(key=lambda x: x["startedAt"]["S"], reverse=True)
         rows = rows[: a.limit]
         print(f"--- last {a.days} days: {len(rows)} call(s) ---")
+    s3c = s3() if a.transcript else None
     for it in rows:
         g = lambda k: it.get(k, {}).get("S", "")
+        call_id = it["callId"]["S"]
         dur = it.get("durationSeconds", {}).get("N")
         dur_s = f"{int(dur) // 60}m{int(dur) % 60:02d}s" if dur else "?"
         print(f"{it['startedAt']['S'][:16]}  {dur_s:>7}  {g('number'):<14} {g('personId') or 'unknown':<10} "
-              f"${it.get('cost', {}).get('N', '0'):<8} {g('endedReason')}")
+              f"${it.get('cost', {}).get('N', '0'):<8} {g('endedReason')}  {call_id}")
         if g("llmNotes"):
             print(f"    {g('llmNotes')[:140]}")
+        if a.transcript:
+            print_transcript_indent(s3c, call_id, it["startedAt"]["S"][:10])
     if not rows:
         print("(no matching calls)")
+
+
+def print_transcript_indent(s3c, call_id, date):
+    # Archive key is calls/<YYYY-MM-DD>/<callId>.json — <date> is startedAt.
+    key = f"calls/{date}/{call_id}.json"
+    try:
+        body = s3c.get_object(Bucket=T("CallLogs"), Key=key)["Body"].read()
+        text = json.loads(body).get("transcript")
+    except Exception:
+        return
+    if not text:
+        return
+    print("    transcript:")
+    for line in text.splitlines():
+        print(f"      {line}" if line else "      ")
 
 
 def cmd_call(a):
@@ -814,6 +834,7 @@ def main():
     c.add_argument("--person", help="slug: everything discussed with this person")
     c.add_argument("--days", type=int, default=7)
     c.add_argument("--limit", type=int, default=25)
+    c.add_argument("--transcript", action="store_true", help="indent each call's transcript under its entry")
     c.set_defaults(fn=cmd_calls)
 
     cl = sub.add_parser("call")
